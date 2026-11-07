@@ -468,12 +468,15 @@ func (in *modelStatsInput) decodeLedgerLine(line []byte, run int, allowed map[st
 		return
 	}
 	// The kinds the proxy writes about itself rather than about a model:
-	// "proxy_start" (recordMarker, main.go), "quotas" (recordQuotas,
-	// main.go:1483) and "search" (search.go:158, whose model is the fixed id
-	// "web-search", not a model in models.json). They are the proxy speaking
-	// about itself, not a ledger row about a model, so they are skipped
-	// whole: not a row, not a rejection. Deciding this before the model check
-	// is what keeps a run that carries them from tripping the reject alert.
+	// "proxy_start" (recordMarker, main.go) and "search" (search.go:158,
+	// whose model is the fixed id "web-search", not a model in models.json).
+	// "quotas" is no longer written -- the synthetic.new quota guard is
+	// gone, so there is no recordQuotas -- but ledgers from before that
+	// change still carry it, and it is skipped all the same. These are the
+	// proxy speaking about itself, not a ledger row about a model, so they
+	// are skipped whole: not a row, not a rejection. Deciding this before
+	// the model check is what keeps a run that carries them from tripping
+	// the reject alert.
 	//
 	// "status" and "abandoned" are the two non-call kinds the report keeps:
 	// each becomes a marker, handled below. Every other kind -- and a line

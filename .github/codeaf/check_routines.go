@@ -137,19 +137,26 @@ func quotaCalibration(entries ledgerJSON, quotas quotasJSON) (changed bool, repo
 }
 
 // checkQuotaCalibration is the live wrapper: it reads the proxy ledger from
-// CODEAF_LEDGER_PATH and the quota snapshots from CODEAF_QUOTAS_PATH, both
-// required, and the configured weekly credit from models.json. A missing
-// environment name or an unreadable file is an error, never a panic.
+// CODEAF_LEDGER_PATH and the quota snapshots from CODEAF_QUOTAS_PATH, and
+// the configured weekly credit from models.json. The ledger is required; a
+// missing or unreadable quota-snapshot file is not an error any more -- the
+// proxy stopped fetching /v2/quotas when chat moved to hosted Otari (issue
+// #1), so snapshots may simply not exist -- and the routine then reports
+// that it has nothing to calibrate and exits clean.
 func checkQuotaCalibration() (string, error) {
 	ledgerPath := os.Getenv("CODEAF_LEDGER_PATH")
 	quotasPath := os.Getenv("CODEAF_QUOTAS_PATH")
-	if ledgerPath == "" || quotasPath == "" {
-		return "", errors.New("quota-calibration: CODEAF_LEDGER_PATH and CODEAF_QUOTAS_PATH are both required")
+	if ledgerPath == "" {
+		return "", errors.New("quota-calibration: CODEAF_LEDGER_PATH is required")
 	}
-	for _, p := range []string{ledgerPath, quotasPath} {
-		if _, err := os.Stat(p); err != nil {
-			return "", fmt.Errorf("quota-calibration: %s: %w", p, err)
-		}
+	if quotasPath == "" {
+		return "quota-calibration: no CODEAF_QUOTAS_PATH; the proxy no longer fetches /v2/quotas, so there are no snapshots to calibrate against", nil
+	}
+	if _, err := os.Stat(ledgerPath); err != nil {
+		return "", fmt.Errorf("quota-calibration: %s: %w", ledgerPath, err)
+	}
+	if _, err := os.Stat(quotasPath); err != nil {
+		return "quota-calibration: no quota snapshots (" + quotasPath + " unreadable); the proxy no longer fetches /v2/quotas, so there is nothing to calibrate against", nil
 	}
 	entries, err := readLedger(ledgerPath)
 	if err != nil {

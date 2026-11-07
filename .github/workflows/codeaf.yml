@@ -8,10 +8,11 @@
 #     review on a labelled PR, from an OWNER/MEMBER/COLLABORATOR
 #                                            -> CodeAF continues on that PR's branch
 #
-# Models come from synthetic.new through `harness proxy` (.github/codeaf/main.go), which serves
-# CodeAF a catalog with synthetic.new's real prices, adds usage.cost to every
-# response, refuses models outside .github/codeaf/models.json and enforces the
-# per-run and per-day spend caps set in that file.
+# Model calls go through hosted Otari (https://eu.api.otari.ai) via `harness
+# proxy` (.github/codeaf/main.go), which serves CodeAF a catalog of the same
+# synthetic.new models, adds usage.cost to every response, refuses models
+# outside .github/codeaf/models.json and enforces the per-run and per-day
+# spend caps set in that file. Web search still goes to synthetic.new.
 #
 # Jobs, split by privilege (AGENTS.md, "Security rules"):
 #   gate     decides whether this event may run at all (read-only)
@@ -253,14 +254,18 @@ jobs:
 
       - name: Start pricing proxy
         env:
+          OTARI_API_KEY: ${{ secrets.OTARI_API_KEY }}
           SYNTHETIC_API_KEY: ${{ secrets.SYNTHETIC_API_KEY }}
           PROXY_WEEK_SPENT_USD: ${{ steps.shared.outputs.week_usd }}
           PROXY_LEDGER: ${{ env.LEDGER_PATH }}
         run: |
-          # The key goes in on stdin so it is not in the proxy's environment,
-          # where the CodeAF job (same user) could read it.
-          key="$SYNTHETIC_API_KEY"; unset SYNTHETIC_API_KEY
-          printf '%s\n' "$key" | nohup "$HARNESS" proxy > "$RUNNER_TEMP/proxy.log" 2>&1 &
+          # The keys go in on stdin so they are not in the proxy's
+          # environment, where the CodeAF job (same user) could read them.
+          # Line 1 is the Otari key (chat goes through hosted Otari), line 2
+          # the synthetic.new key (web search stays on synthetic.new).
+          otari_key="$OTARI_API_KEY"; unset OTARI_API_KEY
+          synthetic_key="$SYNTHETIC_API_KEY"; unset SYNTHETIC_API_KEY
+          printf '%s\n%s\n' "$otari_key" "$synthetic_key" | nohup "$HARNESS" proxy > "$RUNNER_TEMP/proxy.log" 2>&1 &
           for _ in $(seq 30); do curl -fsS http://127.0.0.1:8787/healthz && exit 0; sleep 1; done
           cat "$RUNNER_TEMP/proxy.log"; exit 1
 

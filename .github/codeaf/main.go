@@ -196,18 +196,11 @@ type Limits struct {
 	WeeklyCreditUSD float64 `json:"weekly_credit_usd"` // per rolling week, across runs
 	RunCreditUSD    float64 `json:"run_credit_usd"`    // per workflow run
 	OverageUSD      float64 `json:"overage_usd"`       // API-price USD past the weekly credit; 0 = stop
-	// MinCreditPercent is the floor on synthetic.new's own
-	// weeklyTokenLimit.percentRemaining below which, with overage 0, the
-	// proxy refuses calls. 0 means the default, 10.
-	MinCreditPercent float64 `json:"min_credit_percent"`
 	// SearchesPerRun caps how many web searches (POST /v2/search, issue #58)
 	// one run may forward. Search is in the plan and draws no credit, but a
 	// runaway loop still needs a wall; <=0 means defaultSearchesPerRun.
 	SearchesPerRun int `json:"searches_per_run"`
 }
-
-// defaultMinCreditPercent is the floor used when min_credit_percent is unset.
-const defaultMinCreditPercent = 10
 
 // Alerts are the model-stats routine's thresholds (issue #131). They live
 // here rather than in Go because a threshold is a judgement about the
@@ -482,12 +475,6 @@ func loadConfig(path string) (Config, error) {
 	if cfg.Limits.OverageUSD < 0 {
 		return cfg, fmt.Errorf("%s: limits.overage_usd must not be negative", path)
 	}
-	if cfg.Limits.MinCreditPercent < 0 || cfg.Limits.MinCreditPercent >= 100 {
-		return cfg, fmt.Errorf("%s: limits.min_credit_percent must be in [0, 100)", path)
-	}
-	if cfg.Limits.MinCreditPercent == 0 {
-		cfg.Limits.MinCreditPercent = defaultMinCreditPercent
-	}
 	// The queue defaults to two parallel runs; a negative value is a
 	// mistake, not a wish to run none.
 	switch {
@@ -577,7 +564,10 @@ func harnessDir() string {
 	return filepath.Dir(exe)
 }
 
-// Usage is the OpenAI usage block, plus the cost field CodeAF reads.
+// Usage is the OpenAI usage block, plus the cost field CodeAF reads. Otari
+// adds cost_usd (a decimal string) and pricing_source; the raw cost_usd is
+// kept here and turned into OtariCostUSD by boundedUsage, never by the
+// unmarshaller (a string does not unmarshal into a float).
 type Usage struct {
 	PromptTokens        int `json:"prompt_tokens"`
 	CompletionTokens    int `json:"completion_tokens"`
@@ -587,7 +577,52 @@ type Usage struct {
 	} `json:"prompt_tokens_details,omitempty"`
 	CompletionTokensDetails json.RawMessage `json:"completion_tokens_details,omitempty"`
 	Cost                    float64         `json:"cost"`
+	// OtariCostRaw is the cost_usd the Otari chat upstream reports, before
+	// validation. The relays do not pass upstream's bytes through untouched:
+	// they decode the usage block into this struct and re-marshal it, and
+	// this field carries the raw cost_usd bytes through that re-marshal, so
+	// the client still sees what upstream sent.
+	OtariCostRaw json.RawMessage `json:"cost_usd,omitempty"`
+	// OtariCostUSD is the validated cost_usd (maxOtariCostUSD bounds it).
+	OtariCostUSD float64 `json:"-"`
 }
+
+// maxOtariCostUSD bounds a cost_usd figure Otari may report: a decimal
+// string outside [0, this] is garbled or hostile, not a price, and is
+// dropped rather than recorded.
+const maxOtariCostUSD = 10
+
+// otariCostUSD parses Otari's cost_usd defensively: it accepts a JSON
+// string holding a plain decimal (the documented shape) or a JSON number,
+// and returns (value, true) only when the figure is finite and within
+// [0, maxOtariCostUSD]. Anything else -- quoted junk, a negative, an
+// absurd number -- is dropped, not recorded.
+func otariCostUSD(raw json.RawMessage) (float64, bool) {
+	if len(raw) == 0 {
+		return 0, false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		// Not a string: accept a bare JSON number, nothing else.
+		var f float64
+		if err := json.Unmarshal(raw, &f); err != nil {
+			return 0, false
+		}
+		s = strconv.FormatFloat(f, 'f', -1, 64)
+	}
+	if !otariCostDecimal.MatchString(s) {
+		return 0, false
+	}
+	value, err := strconv.ParseFloat(s, 64)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 || value > maxOtariCostUSD {
+		return 0, false
+	}
+	return value, true
+}
+
+// otariCostDecimal matches a plain decimal string, the documented shape of
+// Otari's cost_usd ("0.000085"); no sign, no exponent, no currency mark.
+var otariCostDecimal = regexp.MustCompile(`^[0-9]{1,12}(\.[0-9]{1,12})?$`)
 
 func (u Usage) cached() int {
 	if u.PromptTokensDetails == nil {
@@ -616,8 +651,9 @@ func (u Usage) reasoningTokens() (int, bool) {
 // includes reasoning tokens) at the model's per-million API list ("overage")
 // rates. It is the cost the ledger, the caps and the report carry; quoting
 // the overage price, not the cheaper subscription credit, is the owner's
-// decision (2026-10-20). The weekly quota itself is enforced from
-// synthetic.new's own percentRemaining, not from these figures.
+// decision (2026-10-20), unchanged now that chat goes through hosted Otari:
+// Otari's own cost_usd is recorded for reference only and never priced
+// from. The spend budget is enforced by Otari and by the caps here.
 func CostOf(m Model, u Usage) float64 {
 	return ApiCostOf(m, u)
 }
@@ -680,6 +716,12 @@ func boundedUsage(m Model, u *Usage) (usage *Usage, dropped bool) {
 		return nil, true
 	}
 	u.Cost = CostOf(m, *u)
+	// Otari's own cost_usd is recorded for reference only (otari_cost_usd in
+	// the ledger); it prices nothing. A figure that fails the bound is
+	// dropped, not recorded; the call's own pricing above is untouched.
+	if value, ok := otariCostUSD(u.OtariCostRaw); ok {
+		u.OtariCostUSD = value
+	}
 	return u, false
 }
 
@@ -687,7 +729,8 @@ func boundedUsage(m Model, u *Usage) (usage *Usage, dropped bool) {
 
 type proxy struct {
 	upstream   string
-	apiKey     string
+	apiKey     string // the Otari key, sent only to the chat upstream
+	searchKey  string // the synthetic.new key, sent only to the search endpoint
 	ledger     string
 	runCap     float64 // per-run credit cap (limits.run_credit_usd)
 	weekCap    float64 // weekly credit cap, shared across runs (limits.weekly_credit_usd)
@@ -707,13 +750,11 @@ type proxy struct {
 	searchURL      string
 	searchesPerRun int
 
-	mu           sync.Mutex
-	runSpent     float64 // credit spent by this run
-	overage      bool    // the weekly credit is exhausted; new calls are billed at API prices
-	overageApi   float64 // API-price USD recorded past the weekly credit
-	searches     int     // web searches forwarded this run (issue #58); capped by searchesPerRun
-	quota        quota   // GET /v2/quotas at startup and every few minutes; an unknown quota never blocks
-	minCreditPct float64 // floor on quota.PercentRemaining (limits.min_credit_percent)
+	mu         sync.Mutex
+	runSpent   float64 // credit spent by this run
+	overage    bool    // the weekly credit is exhausted; new calls are billed at API prices
+	overageApi float64 // API-price USD recorded past the weekly credit
+	searches   int     // web searches forwarded this run (issue #58); capped by searchesPerRun
 }
 
 func envFloat(name string, fallback float64) (float64, error) {
@@ -754,10 +795,11 @@ func upstreamClient() *http.Client {
 
 func runProxy() error {
 	p := &proxy{
-		upstream: strings.TrimRight(envOr("PROXY_UPSTREAM", "https://api.synthetic.new/openai/v1"), "/"),
-		apiKey:   os.Getenv("SYNTHETIC_API_KEY"),
-		ledger:   envOr("PROXY_LEDGER", "codeaf-ledger.jsonl"),
-		client:   upstreamClient(),
+		upstream:  strings.TrimRight(envOr("PROXY_UPSTREAM", "https://eu.api.otari.ai/api/v1"), "/"),
+		apiKey:    os.Getenv("OTARI_API_KEY"),
+		searchKey: os.Getenv("SYNTHETIC_API_KEY"),
+		ledger:    envOr("PROXY_LEDGER", "codeaf-ledger.jsonl"),
+		client:    upstreamClient(),
 	}
 	cfg, err := loadConfig(configPath())
 	if err != nil {
@@ -767,7 +809,6 @@ func runProxy() error {
 	p.runCap = cfg.Limits.RunCreditUSD
 	p.weekCap = cfg.Limits.WeeklyCreditUSD
 	p.overageCap = cfg.Limits.OverageUSD
-	p.minCreditPct = cfg.Limits.MinCreditPercent
 	p.slots = newSlots(p.models, cfg.Queue.MaxParallelRuns)
 	// Web search (issue #58): the endpoint to forward to and the per-run cap
 	// from models.json (<=0 means defaultSearchesPerRun in the handler).
@@ -776,13 +817,28 @@ func runProxy() error {
 	if p.weekSpent, err = spentWeek("PROXY_WEEK_SPENT_USD"); err != nil {
 		return err
 	}
-	// Preferred: the key arrives on stdin, so it is not in /proc/<pid>/environ
-	// where the CodeAF job (same user) could read it.
-	if p.apiKey == "" {
-		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
-		p.apiKey = strings.TrimSpace(line)
+	// Preferred: the keys arrive on stdin, so they are never in the proxy's
+	// process environment, which the CodeAF job (same user) could read.
+	// Line 1 is the Otari key (OTARI_API_KEY), line 2 the synthetic.new key
+	// (SYNTHETIC_API_KEY); an env fallback takes the place of the stdin line
+	// it replaces, and the stdin lines are still consumed in order. The
+	// Otari key is sent only to the chat upstream and the synthetic.new key
+	// only to the search endpoint; neither is ever logged.
+	if p.apiKey == "" || p.searchKey == "" {
+		reader := bufio.NewReader(os.Stdin)
+		line1, _ := reader.ReadString('\n')
+		if p.apiKey == "" {
+			p.apiKey = strings.TrimSpace(line1)
+		}
+		if p.searchKey == "" {
+			line2, _ := reader.ReadString('\n')
+			p.searchKey = strings.TrimSpace(line2)
+		}
 	}
 	if p.apiKey == "" {
+		return errors.New("no OTARI_API_KEY in the environment or on stdin")
+	}
+	if p.searchKey == "" {
 		return errors.New("no SYNTHETIC_API_KEY in the environment or on stdin")
 	}
 	addr := "127.0.0.1:" + envOr("PROXY_PORT", "8787")
@@ -790,12 +846,9 @@ func runProxy() error {
 	// One marker line at the top of the ledger; the report times the CodeAF
 	// session from it to the last call's end.
 	p.recordMarker("proxy_start")
-	// Ask synthetic.new for the subscription state at start (issue #59
-	// step 3), then every few minutes: several runs share one weekly credit,
-	// so another run can use it up while this one works. /v2/quotas calls
-	// don't count against the plan. Best-effort: never breaks the run.
-	p.fetchQuotasStartup()
-	go p.refreshQuotas(quotasRefreshEvery)
+	// No /v2/quotas fetch any more: chat goes through hosted Otari, and
+	// Otari enforces the organisation's own budget and balance. The
+	// factory's run/week/overage caps below stay as runaway guards.
 	return http.ListenAndServe(addr, p)
 }
 
@@ -966,11 +1019,198 @@ func EffortFor(m Model, reasoning reasoningRequest) string {
 	return m.Efforts[len(m.Efforts)-1]
 }
 
-// openRouterOnly are request fields synthetic.new does not understand.
-var openRouterOnly = []string{"provider", "transforms", "route", "models", "usage", "plugins", "include_reasoning", "reasoning"}
+// chatRequestKeys is the exact, case-sensitive allowlist of the top-level
+// request keys RewriteRequest forwards to Otari. The agent's request is
+// untrusted input, and Otari's chat API acts on gateway-only fields of its
+// own (mcp_servers, guardrails, tools_header, ...) and bills some of them
+// outside the factory's caps, so nothing else may reach it. A blocklist
+// cannot be trusted here: encoding/json matches struct and map keys
+// case-insensitively, so MCP_SERVERS or Mcp_Servers would slip past an
+// exact-key delete of mcp_servers. An allowlist of known-safe keys cannot
+// be bypassed that way -- anything not spelled exactly as below is dropped,
+// which also drops user, metadata, safety_identifier, web_search_options
+// and every mcp_*, guardrails, tools_header, max_tool_iterations and
+// session_label field. model, reasoning_effort, stream and stream_options
+// are on the list because the proxy itself sets or rewrites them below.
+var chatRequestKeys = []string{
+	"model", "messages", "tools", "tool_choice", "parallel_tool_calls",
+	"stream", "stream_options",
+	"temperature", "top_p", "max_tokens", "max_completion_tokens", "stop", "seed", "n",
+	"frequency_penalty", "presence_penalty", "logprobs", "top_logprobs", "response_format",
+	"reasoning_effort",
+}
 
-// RewriteRequest rewrites a chat request for synthetic.new. Fields it does not
-// know about pass through untouched.
+// exactString decodes raw as a JSON string. A non-string (null, number,
+// object) is not a type or name and never matches.
+func exactString(raw json.RawMessage) (string, bool) {
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", false
+	}
+	return s, true
+}
+
+// hasFoldingDuplicate reports whether m holds another key that equals key
+// under Unicode case-folding -- the tool {"type":"function",
+// "TYPE":"otari_code_execution"} must not pass as a plain function just
+// because its exact "type" says so: Otari reads the lowercase key, and the
+// uppercase twin is how a case-insensitive decoder would be tricked.
+func hasFoldingDuplicate(m map[string]json.RawMessage, key string) bool {
+	for k := range m {
+		if k != key && strings.EqualFold(k, key) {
+			return true
+		}
+	}
+	return false
+}
+
+// stripOtariGatewayTools rebuilds the request's tools array and tool_choice
+// in canonical form. Every tool entry Otari runs server-side -- type "mcp",
+// the otari_* tools (otari_web_search, otari_web_fetch,
+// otari_code_execution) and the native aliases (code_execution,
+// code_interpreter, code_execution_<date>, web_search, web_search_<date>,
+// web_search_preview, web_fetch_<date>) -- is billed outside the factory's
+// caps, so an agent must not be able to call for one. A tool is kept only
+// when its exact "type" key decodes to "function", no other key equals
+// "type" under case-folding, and its exact "function" key holds a JSON
+// object; it is re-emitted as exactly {"type":"function","function":...},
+// so no smuggled field survives inside a kept entry. tool_choice follows
+// the tools: dropped when no tools remain; the "auto"/"none"/"required"
+// strings kept only while tools do; an object kept only when it names a
+// kept function tool, re-emitted canonically. (Issue #2 will add the
+// proxy's own controlled otari_web_search entry after this stripping.)
+func stripOtariGatewayTools(body map[string]json.RawMessage) {
+	var keptNames map[string]bool
+	if raw, ok := body["tools"]; ok {
+		var tools []json.RawMessage
+		kept := make([]json.RawMessage, 0, 8)
+		keptNames = map[string]bool{}
+		if json.Unmarshal(raw, &tools) == nil {
+			for _, tool := range tools {
+				var entry map[string]json.RawMessage
+				if json.Unmarshal(tool, &entry) != nil {
+					continue
+				}
+				typRaw, ok := entry["type"]
+				if !ok || hasFoldingDuplicate(entry, "type") {
+					continue
+				}
+				if typ, ok := exactString(typRaw); !ok || typ != "function" {
+					continue
+				}
+				fnRaw, ok := entry["function"]
+				if !ok {
+					continue
+				}
+				var fn map[string]json.RawMessage
+				if json.Unmarshal(fnRaw, &fn) != nil {
+					continue
+				}
+				canonical, err := json.Marshal(struct {
+					Type     string          `json:"type"`
+					Function json.RawMessage `json:"function"`
+				}{Type: "function", Function: fnRaw})
+				if err != nil {
+					continue
+				}
+				kept = append(kept, canonical)
+				if nameRaw, ok := fn["name"]; ok {
+					if name, ok := exactString(nameRaw); ok {
+						keptNames[name] = true
+					}
+				}
+			}
+		}
+		if len(kept) == 0 {
+			delete(body, "tools")
+		} else {
+			body["tools"], _ = json.Marshal(kept)
+		}
+	}
+	choice, ok := body["tool_choice"]
+	if !ok {
+		return
+	}
+	if len(keptNames) == 0 {
+		delete(body, "tool_choice")
+		return
+	}
+	var s string
+	if json.Unmarshal(choice, &s) == nil {
+		if s != "auto" && s != "none" && s != "required" {
+			delete(body, "tool_choice")
+		}
+		return
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(choice, &obj) != nil {
+		delete(body, "tool_choice")
+		return
+	}
+	typRaw, ok := obj["type"]
+	if !ok || hasFoldingDuplicate(obj, "type") {
+		delete(body, "tool_choice")
+		return
+	}
+	typ, ok := exactString(typRaw)
+	if !ok || typ != "function" {
+		delete(body, "tool_choice")
+		return
+	}
+	fnRaw, ok := obj["function"]
+	if !ok {
+		delete(body, "tool_choice")
+		return
+	}
+	var fn map[string]json.RawMessage
+	if json.Unmarshal(fnRaw, &fn) != nil {
+		delete(body, "tool_choice")
+		return
+	}
+	nameRaw, ok := fn["name"]
+	if !ok {
+		delete(body, "tool_choice")
+		return
+	}
+	name, ok := exactString(nameRaw)
+	if !ok || !keptNames[name] {
+		delete(body, "tool_choice")
+		return
+	}
+	canonical, err := json.Marshal(struct {
+		Type     string          `json:"type"`
+		Function json.RawMessage `json:"function"`
+	}{Type: "function", Function: mustNameObject(nameRaw)})
+	if err != nil {
+		delete(body, "tool_choice")
+		return
+	}
+	body["tool_choice"] = canonical
+}
+
+// mustNameObject wraps a JSON string in {"name": <raw>}, the canonical
+// function object of a tool_choice. mustNameObject is only called with raw
+// values exactString has already decoded, so the marshal cannot fail.
+func mustNameObject(nameRaw json.RawMessage) json.RawMessage {
+	out, err := json.Marshal(struct {
+		Name json.RawMessage `json:"name"`
+	}{Name: nameRaw})
+	if err != nil {
+		return json.RawMessage("{}")
+	}
+	return out
+}
+
+// RewriteRequest rewrites a chat request for hosted Otari, which fronts the
+// same synthetic.new models. Otari selects a provider model with a
+// provider:model selector, and the provider is named "synthetic.new", so the
+// model sent upstream is "synthetic.new:" + the synthetic.new model id
+// (models.json's upstream field) -- e.g. synthetic.new:hf:zai-org/GLM-5.3-Flash
+// -- which pins the call to the synthetic.new provider key. The body is then
+// rebuilt from the chatRequestKeys allowlist -- the agent's request is
+// untrusted, and an allowlist cannot be bypassed the way a blocklist can --
+// and the tools and tool_choice are rebuilt in canonical function-only form
+// (stripOtariGatewayTools): the agent gets plain function tool calls only.
 func RewriteRequest(body map[string]json.RawMessage, m Model) (stream bool, err error) {
 	if raw, ok := body["reasoning"]; ok {
 		var reasoning reasoningRequest
@@ -980,10 +1220,21 @@ func RewriteRequest(body map[string]json.RawMessage, m Model) (stream bool, err 
 			}
 		}
 	}
-	for _, key := range openRouterOnly {
+	stripOtariGatewayTools(body)
+	forward := make(map[string]json.RawMessage, len(body))
+	for _, key := range chatRequestKeys {
+		if raw, ok := body[key]; ok {
+			forward[key] = raw
+		}
+	}
+	for key := range body {
 		delete(body, key)
 	}
-	body["model"], _ = json.Marshal(m.Upstream)
+	for key, raw := range forward {
+		body[key] = raw
+	}
+	body["model"], _ = json.Marshal("synthetic.new:" + m.Upstream)
+	body["model"], _ = json.Marshal("synthetic.new:" + m.Upstream)
 	if raw, ok := body["stream"]; ok {
 		_ = json.Unmarshal(raw, &stream)
 	}
@@ -1182,8 +1433,15 @@ type LedgerLine struct {
 	// written before the field existed parses back as 0 (json.Unmarshal of a
 	// missing field), and omitempty keeps the common zero off the wire.
 	APICostUSD float64 `json:"api_cost_usd,omitempty"`
-	Stream     bool    `json:"stream"`
-	UsageSeen  bool    `json:"usage_seen"`
+	// OtariCostUSD is the cost_usd the hosted-Otari chat upstream reported
+	// for the call (pricing_source organization), recorded for reference
+	// only: caps and every reported figure price from CostOf at the
+	// api_* list rates (the owner's decision), and the proxy's in-memory
+	// total stays the source of truth. A missing, non-numeric or absurd
+	// cost_usd records nothing (omitempty).
+	OtariCostUSD float64 `json:"otari_cost_usd,omitempty"`
+	Stream       bool    `json:"stream"`
+	UsageSeen    bool    `json:"usage_seen"`
 	// Start is when the upstream request was issued, after any wait for a
 	// slot; ts is when the call ended. SlotWaitS is how long the call queued
 	// for a model slot. Old ledgers carry neither.
@@ -1196,9 +1454,6 @@ type LedgerLine struct {
 	// Old ledgers carry no field and parse back as 0.
 	HeaderMs int64  `json:"header_ms,omitempty"`
 	Kind     string `json:"kind,omitempty"`
-	// Quotas carries the raw GET /v2/quotas response body on the "quotas"
-	// marker line, capped (recordQuotas); the report re-parses it from here.
-	Quotas string `json:"quotas,omitempty"`
 	// Search lines (kind "search", issue #58) carry the query's length in
 	// runes and how many results came back — never the query text, which
 	// must not land in the ledger.
@@ -1287,6 +1542,7 @@ func (p *proxy) record(m Model, usage *Usage, usageDropped, stream bool, start t
 		line.PromptTokens, line.CachedTokens, line.CompletionTokens = usage.PromptTokens, usage.cached(), usage.CompletionTokens
 		line.CostUSD = usage.Cost
 		line.APICostUSD = ApiCostOf(m, *usage)
+		line.OtariCostUSD = usage.OtariCostUSD
 		if n, ok := usage.reasoningTokens(); ok {
 			line.ReasoningTokens = &n
 		}
@@ -1365,236 +1621,6 @@ func (p *proxy) appendLedger(line any) {
 	_, _ = f.Write(append(data, '\n'))
 }
 
-// ------------------------------------------------------------- quotas
-
-const (
-	// quotasMarkerCap caps the raw /v2/quotas body kept in the ledger marker
-	// and in the proxy log: diagnostics, not data to serve calls from.
-	quotasMarkerCap = 4 << 10
-	// quotasReadCap bounds how much of the response body is read at all, so
-	// a broken or hostile upstream cannot balloon the proxy's memory.
-	quotasReadCap = 64 << 10
-	// quotasTimeout bounds the startup fetch; the run must not wait on it.
-	quotasTimeout = 15 * time.Second
-)
-
-// quota is the subscription state GET /v2/quotas reports. The response's
-// units are undocumented (issue #59), so the parse is defensive: the numbers
-// are believed only when both arrive as JSON numbers and are sane, and
-// anything else — a body that does not parse, a missing subscription, quoted
-// numbers, a negative or zero limit — leaves Known false. Nothing here may
-// fail a run only because the fields are unfamiliar.
-type quota struct {
-	Limit    float64 // subscription.limit
-	Requests float64 // subscription.requests
-	RenewsAt string  // subscription.renewsAt, as the API sent it
-	Known    bool    // both numbers parsed and passed the sanity checks
-	// PercentRemaining is weeklyTokenLimit.percentRemaining: the share of
-	// the weekly credit left, which is what actually runs out on the Big
-	// plan (the subscription request counter stays at 0).
-	PercentRemaining float64
-	PercentKnown     bool
-}
-
-// parseQuotas parses a /v2/quotas body defensively. It returns no error, only
-// Known false when the shape is not the expected one.
-func parseQuotas(body []byte) quota {
-	var doc struct {
-		Subscription *struct {
-			Limit    json.RawMessage `json:"limit"`
-			Requests json.RawMessage `json:"requests"`
-			RenewsAt json.RawMessage `json:"renewsAt"`
-		} `json:"subscription"`
-	}
-	var q quota
-	var weekly struct {
-		WeeklyTokenLimit *struct {
-			PercentRemaining json.RawMessage `json:"percentRemaining"`
-		} `json:"weeklyTokenLimit"`
-	}
-	if json.Unmarshal(body, &weekly) == nil && weekly.WeeklyTokenLimit != nil {
-		if pct, ok := jsonNumber(weekly.WeeklyTokenLimit.PercentRemaining); ok && pct >= 0 && pct <= 100 {
-			q.PercentRemaining, q.PercentKnown = pct, true
-		}
-	}
-	if err := json.Unmarshal(body, &doc); err != nil || doc.Subscription == nil {
-		return q
-	}
-	limit, okLimit := jsonNumber(doc.Subscription.Limit)
-	requests, okRequests := jsonNumber(doc.Subscription.Requests)
-	if !okLimit || !okRequests || limit <= 0 || requests < 0 {
-		return q
-	}
-	q.Limit, q.Requests, q.Known = limit, requests, true
-	if doc.Subscription.RenewsAt != nil {
-		_ = json.Unmarshal(doc.Subscription.RenewsAt, &q.RenewsAt)
-	}
-	return q
-}
-
-// jsonNumber accepts exactly a JSON number; a quoted value is unfamiliar, not
-// coerced, and out-of-range numbers are refused like any other.
-func jsonNumber(raw json.RawMessage) (float64, bool) {
-	if len(raw) == 0 {
-		return 0, false
-	}
-	var value float64
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return 0, false
-	}
-	if math.IsNaN(value) || math.IsInf(value, 0) {
-		return 0, false
-	}
-	return value, true
-}
-
-// quotasURL derives the /v2/quotas endpoint from the chat upstream: the chat
-// base is https://api.synthetic.new/openai/v1, and the quota endpoint lives
-// at the API root, not under /openai/v1.
-func quotasURL(upstream string) string {
-	base := strings.TrimSuffix(strings.TrimRight(upstream, "/"), "/openai/v1")
-	return base + "/v2/quotas"
-}
-
-// fetchQuotas GETs the subscription state. It returns the parsed quota and
-// the raw response body (for the log and the ledger marker), and an error on
-// any network or HTTP failure. The Authorization header carries the key and
-// is never logged or written; the raw body never contains it. This call does
-// not count against the subscription's limits.
-// quotaNumberString matches a number written as a string, optionally with a
-// leading dollar sign: the shape of synthetic.new's credit figures.
-var quotaNumberString = regexp.MustCompile(`^\$?-?[0-9]{1,15}(\.[0-9]{1,12})?$`)
-
-// redactQuotasBody keeps a /v2/quotas body's keys, numbers, booleans, nulls
-// and RFC 3339 timestamps, and replaces every other string with
-// "[redacted]". A body that is not JSON is reduced to its length.
-func redactQuotasBody(raw string) string {
-	var v any
-	if err := json.Unmarshal([]byte(raw), &v); err != nil {
-		return fmt.Sprintf("[non-JSON body, %d bytes]", len(raw))
-	}
-	var walk func(any) any
-	walk = func(x any) any {
-		switch t := x.(type) {
-		case map[string]any:
-			for k, val := range t {
-				t[k] = walk(val)
-			}
-			return t
-		case []any:
-			for i, val := range t {
-				t[i] = walk(val)
-			}
-			return t
-		case string:
-			if _, err := time.Parse(time.RFC3339Nano, t); err == nil {
-				return t
-			}
-			// Credit figures arrive as strings ("12.34", "$12.34"); a number
-			// is not personal data, and it is what calibrates the limits.
-			if quotaNumberString.MatchString(t) {
-				return t
-			}
-			return "[redacted]"
-		default:
-			return t
-		}
-	}
-	out, err := json.Marshal(walk(v))
-	if err != nil {
-		return "[unrenderable body]"
-	}
-	return string(out)
-}
-
-func fetchQuotas(ctx context.Context, client *http.Client, url, key string) (quota, string, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return quota{}, "", err
-	}
-	request.Header.Set("Authorization", "Bearer "+key)
-	response, err := client.Do(request)
-	if err != nil {
-		return quota{}, "", err
-	}
-	defer response.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(response.Body, quotasReadCap))
-	if err != nil {
-		return quota{}, string(body), err
-	}
-	if response.StatusCode != http.StatusOK {
-		return quota{}, string(body), fmt.Errorf("status %d", response.StatusCode)
-	}
-	return parseQuotas(body), string(body), nil
-}
-
-// fetchQuotasStartup asks synthetic.new for the subscription state once, at
-// proxy start, and keeps the parsed result for overCap. Best-effort by
-// contract: any failure is logged and leaves the quota unknown, so startup
-// never breaks and an unfamiliar shape never blocks a call. The raw body is
-// logged (capped, no key) and appended to the ledger as the "quotas" marker
-// the report reads.
-func (p *proxy) fetchQuotasStartup() {
-	ctx, cancel := context.WithTimeout(context.Background(), quotasTimeout)
-	defer cancel()
-	client := &http.Client{Timeout: quotasTimeout}
-	url := quotasURL(p.upstream)
-	q, raw, err := fetchQuotas(ctx, client, url, p.apiKey)
-	switch {
-	case err != nil:
-		log.Printf("quotas: GET %s failed (%v); continuing with the quota unknown", url, err)
-	case !q.Known:
-		log.Printf("quotas: unfamiliar shape; continuing with the quota unknown")
-	}
-	if raw != "" {
-		// The diagnostics and the ledger are public artifacts, so only the
-		// body's shape, numbers, booleans and timestamps are kept: any other
-		// string an account endpoint might return is redacted.
-		redacted := redactQuotasBody(raw)
-		log.Printf("quotas: body (redacted, capped): %s", capString(redacted, quotasMarkerCap))
-		p.recordQuotas(redacted)
-	}
-	p.mu.Lock()
-	p.quota = q
-	p.mu.Unlock()
-}
-
-// quotasRefreshEvery is how often the proxy re-reads /v2/quotas mid-run.
-const quotasRefreshEvery = 5 * time.Minute
-
-// refreshQuotas re-reads /v2/quotas every interval and keeps the newest
-// parsed result that knows the weekly credit. A failed or unfamiliar read
-// keeps the previous one: a missing answer never blocks, and never unblocks.
-func (p *proxy) refreshQuotas(every time.Duration) {
-	ticker := time.NewTicker(every)
-	defer ticker.Stop()
-	for range ticker.C {
-		ctx, cancel := context.WithTimeout(context.Background(), quotasTimeout)
-		q, _, err := fetchQuotas(ctx, &http.Client{Timeout: quotasTimeout}, quotasURL(p.upstream), p.apiKey)
-		cancel()
-		if err != nil || !q.PercentKnown {
-			continue
-		}
-		log.Printf("quotas: %.1f%% of the weekly credit left", q.PercentRemaining)
-		p.mu.Lock()
-		p.quota = q
-		p.mu.Unlock()
-	}
-}
-
-// recordQuotas appends the quotas marker: kind, ts and the raw response body,
-// capped. The report re-parses the body from the ledger.
-func (p *proxy) recordQuotas(raw string) {
-	line := struct {
-		Kind   string    `json:"kind"`
-		Time   time.Time `json:"ts"`
-		Quotas string    `json:"quotas"`
-	}{Kind: "quotas", Time: time.Now().UTC(), Quotas: capString(raw, quotasMarkerCap)}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.appendLedger(line)
-}
-
 // capString cuts s to at most max bytes, back to a UTF-8 rune boundary.
 func capString(s string, max int) string {
 	if len(s) <= max {
@@ -1616,20 +1642,6 @@ func (p *proxy) overCap() string {
 	defer p.mu.Unlock()
 	if p.runSpent >= p.runCap {
 		return fmt.Sprintf("per-run credit cap $%.2f reached ($%.4f spent)", p.runCap, p.runSpent)
-	}
-	// The subscription quota reported exhausted at startup (GET /v2/quotas)
-	// and overage is disabled: refuse before a call is billed at API prices
-	// the factory chose not to pay (issue #59 step 3). An unknown quota —
-	// fetch failed or unfamiliar shape — never blocks.
-	if p.quota.Known && p.quota.Limit > 0 && p.quota.Requests >= p.quota.Limit && p.overageCap <= 0 {
-		return fmt.Sprintf("the subscription quota reports exhausted and overage is disabled (limit %s, used %s at proxy start)",
-			trimNumber(p.quota.Limit), trimNumber(p.quota.Requests))
-	}
-	// synthetic.new's own count of the weekly credit, refreshed every few
-	// minutes: below the floor, with overage disabled, stop before the
-	// account starts billing at API prices.
-	if p.quota.PercentKnown && p.overageCap <= 0 && p.quota.PercentRemaining < p.minCreditPct {
-		return fmt.Sprintf("synthetic.new reports %.1f%% of the weekly credit left, under the %.0f%% floor; overage disabled, refusing", p.quota.PercentRemaining, p.minCreditPct)
 	}
 	if p.weekSpent+p.runSpent < p.weekCap {
 		return ""
@@ -1729,6 +1741,9 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		p.fail(w, out, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// The Otari key authenticates the chat upstream, and only it: the
+	// synthetic.new key (p.searchKey) never reaches this request, and this
+	// key never reaches the search endpoint. Neither is ever logged.
 	request.Header.Set("Authorization", "Bearer "+p.apiKey)
 	request.Header.Set("Content-Type", "application/json")
 	if stream {
@@ -2780,6 +2795,12 @@ func (g github) patch(path string, body, into any) error {
 // less than this, so a stop at the cap is a truncation, not a failure.
 const diffReadCap = 1 << 20
 
+// errorBodyReadCap bounds how much of an error response body is read at all,
+// so a broken or hostile upstream cannot balloon the proxy's memory. It was
+// quotasReadCap when the proxy still fetched /v2/quotas; the quota fetch is
+// gone (chat goes through hosted Otari now) and this is its only user.
+const errorBodyReadCap = 64 << 10
+
 // diffFetchNote is what a fetched diff ends with when the body stopped at
 // diffReadCap: the reviewer must see that the diff is incomplete instead
 // of silently reviewing a prefix (issue #458).
@@ -2814,7 +2835,7 @@ func (g github) diff(n int) (string, bool, error) {
 		// The error body is untrusted too, and it is only ever shown as a
 		// short excerpt, so it is read through the same bound every sibling
 		// read uses (issue #458 review finding).
-		data, _ := io.ReadAll(io.LimitReader(response.Body, quotasReadCap))
+		data, _ := io.ReadAll(io.LimitReader(response.Body, errorBodyReadCap))
 		return "", false, fmt.Errorf("GET /pulls/%d diff: %s: %.300s", n, response.Status, data)
 	}
 	data, err := io.ReadAll(io.LimitReader(response.Body, diffReadCap+1))
@@ -4943,24 +4964,6 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 	}
 	fmt.Fprintf(&b, "| metered by proxy (from its ledger) | **%s** this run at overage prices · %s this week (cap $%s/run, $%s/week) · %s overage%s |\n",
 		money(total), weekCell, trimNumber(cfg.Limits.RunCreditUSD), trimNumber(cfg.Limits.WeeklyCreditUSD), money(overage), statusCell)
-	// The quota state synthetic.new reported at proxy start, re-parsed from
-	// the ledger's "quotas" marker. Omitted when the marker is absent or
-	// its body does not parse; the units are undocumented, so the row says
-	// so. Values pass escapeMD: the marker body is untrusted input.
-	for _, l := range lines {
-		if l.Kind != "quotas" {
-			continue
-		}
-		if q := parseQuotas([]byte(l.Quotas)); q.Known {
-			renews := "—"
-			if s := escapeMD(q.RenewsAt, 80, true); s != "" {
-				renews = s
-			}
-			fmt.Fprintf(&b, "| synthetic.new quota | limit %s, used %s, renewsAt %s (units undocumented) |\n",
-				trimNumber(q.Limit), trimNumber(q.Requests), renews)
-		}
-		break
-	}
 	// Web searches through the proxy (issue #58): one row, and only when
 	// the run made any. Search lines cost 0 until synthetic.new documents a
 	// price; a price would flow through CostUSD into the metered row above.

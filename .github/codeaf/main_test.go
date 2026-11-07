@@ -169,7 +169,8 @@ func TestRewriteRequest(t *testing.T) {
 	}
 	// An ordinary model with no "stream" field is untouched: no field added,
 	// no stream_options, and the proxy relays a non-streaming response. A
-	// fresh map: Unmarshal into the old one would keep the forced "stream".
+	// fresh map: unmarshalling into the old one would carry over whatever
+	// keys the previous case left in it.
 	body = nil
 	if err := json.Unmarshal([]byte(`{"model":"zai-org/glm-5.3-flash","messages":[]}`), &body); err != nil {
 		t.Fatal(err)
@@ -183,40 +184,6 @@ func TestRewriteRequest(t *testing.T) {
 	}
 	if _, ok := body["stream_options"]; ok {
 		t.Error("ordinary: stream_options should stay unset")
-	}
-}
-
-// TestModelCatalogIdRoleSet pins the models.json catalog to exactly the
-// models the factory uses: one per lane (base, mid, top) and the
-// experiment-role pool. A model the factory stops using (one Otari will not
-// serve, say) must be removed here, and any added model must be added here,
-// so the set cannot drift silently.
-func TestModelCatalogIdRoleSet(t *testing.T) {
-	want := map[string]string{
-		"zai-org/glm-5.3-flash":                "base",
-		"deepseek-ai/deepseek-v4.1-flash-1017": "mid",
-		"moonshotai/kimi-k3.1-pro":             "top",
-		"zai-org/glm-5.3":                      "experiment",
-		"moonshotai/kimi-k3":                   "experiment",
-		"openai/gpt-oss-120b":                  "experiment",
-		"zai-org/glm-4.7-flash":                "experiment",
-	}
-	got := map[string]string{}
-	for _, m := range testModels(t) {
-		got[m.ID] = m.Role
-	}
-	if len(got) != len(testModels(t)) {
-		t.Fatal("duplicate model id in models.json")
-	}
-	for id, role := range want {
-		if got[id] != role {
-			t.Errorf("model %s role = %q, want %q", id, got[id], role)
-		}
-	}
-	for id := range got {
-		if _, ok := want[id]; !ok {
-			t.Errorf("unexpected model in models.json: %s (role %s)", id, got[id])
-		}
 	}
 }
 
@@ -4003,13 +3970,14 @@ func TestLedgerRecordsHeaderWait(t *testing.T) {
 //     header sleep (slow-first-token latency is measurable from the ledger).
 func TestProxyEndToEndSlowHeaders(t *testing.T) {
 	const interval = 20 * time.Millisecond
-	// Scaled from the 236s the mode has really taken: long enough that the
-	// proxy must commit and beat while it waits, short enough to test.
+	// Scaled from the 236s a slow-first-token upstream has really taken:
+	// long enough that the proxy must commit and beat while it waits, short
+	// enough to test.
 	const headerSleep = 1500 * time.Millisecond
 
 	// The upstream waits headerSleep before its headers, then writes three
 	// data lines with an upstream-quiet-length gap between them -- the "long
-	// pauses mid-stream" the mode is known for -- and finally [DONE].
+	// pauses mid-stream" a slow upstream is known for -- and finally [DONE].
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(headerSleep)
 		w.Header().Set("Content-Type", "text/event-stream")

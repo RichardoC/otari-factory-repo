@@ -222,7 +222,7 @@ func runRecordFromRun(now time.Time) RunRecord {
 			switch l.Kind {
 			case "proxy_start":
 			case "search":
-				r.Searches++
+				r.Searches++ // an old ledger's forwarded-search line
 			case "status":
 				if l.Status == 429 {
 					r.Rate429++
@@ -231,6 +231,7 @@ func runRecordFromRun(now time.Time) RunRecord {
 				// A recorded call. Unknown kinds stay uncounted: they cost
 				// money (ledgerTotal still sums them) but are not calls.
 				r.Calls++
+				r.Searches += l.Searches // searches Otari ran inside the call (issue #2)
 				r.SlotWaitSeconds += clampSeconds(l.SlotWaitS)
 				if l.SlotWaitS > 0 {
 					r.HeartbeatCalls++

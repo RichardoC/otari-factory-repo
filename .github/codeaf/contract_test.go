@@ -685,17 +685,6 @@ func TestContract(t *testing.T) {
 		}
 	})
 
-	t.Run("search", func(t *testing.T) {
-		needContractBin(t)
-		_, stderr, code := runHarness(t, nil, "search", "--help")
-		if code != 2 {
-			t.Errorf("search --help: exit %d, want the usage exit 2", code)
-		}
-		if want := `usage: harness search "<query>" [--limit N]`; !strings.HasPrefix(stderr, want) {
-			t.Errorf("search --help stderr = %q, want the usage line %q first", stderr, want)
-		}
-	})
-
 	t.Run("merge-default", func(t *testing.T) {
 		needContractBin(t)
 		// Not a pr run: the command is a no-op.

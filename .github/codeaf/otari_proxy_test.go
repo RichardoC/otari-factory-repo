@@ -92,20 +92,23 @@ func (s *seenRequests) snapshot() (paths, auths, bodies []string) {
 	return append([]string{}, s.paths...), append([]string{}, s.auths...), append([]string{}, s.bodies...)
 }
 
-// TestProxyOtariTwoKeysEndToEnd runs the built harness binary as `proxy` with
-// the two keys on stdin — the way the "Start pricing proxy" step passes them —
-// pointed at a stub Otari chat upstream and a stub search endpoint, and shows:
-// a chat call reaches /chat/completions with `Authorization: Bearer otari-test-key`
-// and model `synthetic.new:hf:zai-org/GLM-5.3-Flash`; a /v2/search call reaches the
-// search endpoint with `Authorization: Bearer synthetic-test-key`; neither key ever
-// appears on the other endpoint; and the proxy makes no /v2/quotas request, so a
-// quota that would previously have sat under min_credit_percent cannot refuse the
-// call (the stub serves one anyway, and it is never asked).
-func TestProxyOtariTwoKeysEndToEnd(t *testing.T) {
+// TestProxyOtariKeyEndToEnd runs the built harness binary as `proxy` with
+// the one Otari key on stdin — the way the "Start pricing proxy" step passes
+// it — pointed at a stub Otari chat upstream, and shows: a chat call reaches
+// /chat/completions with `Authorization: Bearer otari-test-key`, the model
+// sent as Otari's "synthetic.new:" selector, and the caller's function tools
+// plus exactly one proxy-declared {"type":"otari_web_search","max_uses":3}
+// (the fixture config's search_max_uses_per_call default) — any otari_* tool
+// the caller sent (here otari_web_fetch, and otari_web_search with
+// max_uses: 99) is dropped, so the agent can neither raise the cap nor
+// declare fetch or code execution; Otari's own cost_usd is recorded for
+// reference only; no quota call is made; and the old POST /v2/search
+// endpoint is gone (issue #2): it answers 404, and a second stdin line is
+// ignored rather than required.
+func TestProxyOtariKeyEndToEnd(t *testing.T) {
 	needContractBin(t)
 
 	const otariKey = "otari-test-key"
-	const syntheticKey = "synthetic-test-key"
 
 	chat := &seenRequests{}
 	chatStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -128,15 +131,6 @@ func TestProxyOtariTwoKeysEndToEnd(t *testing.T) {
 	}))
 	defer chatStub.Close()
 
-	search := &seenRequests{}
-	searchStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		search.add(r.URL.Path, r.Header.Get("Authorization"), string(body))
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"results":[{"title":"t","url":"https://example.com"}]}`)
-	}))
-	defer searchStub.Close()
-
 	// A free port for the proxy to listen on.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -151,15 +145,15 @@ func TestProxyOtariTwoKeysEndToEnd(t *testing.T) {
 	cmd.Env = []string{
 		"PATH=" + os.Getenv("PATH"),
 		"PROXY_UPSTREAM=" + chatStub.URL,
-		"PROXY_SEARCH_URL=" + searchStub.URL,
 		"PROXY_MODELS=" + otariModels(t),
 		"PROXY_LEDGER=" + ledger,
 		"PROXY_WEEK_SPENT_USD=0",
 		"PROXY_PORT=" + fmt.Sprint(port),
 	}
-	// The two keys go in on stdin, line 1 Otari, line 2 synthetic.new —
-	// exactly what the workflow's printf feeds the proxy.
-	cmd.Stdin = strings.NewReader(otariKey + "\n" + syntheticKey + "\n")
+	// Line 1 is the Otari key — the only key the proxy holds now (issue #2).
+	// A second line is history: it is read past and ignored, and its absence
+	// or presence changes nothing. It is NOT a key.
+	cmd.Stdin = strings.NewReader(otariKey + "\nsecond-line-is-not-a-key\n")
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
@@ -194,10 +188,13 @@ func TestProxyOtariTwoKeysEndToEnd(t *testing.T) {
 	}
 
 	// A chat call: the catalog id resolves, upstream sees the Otari bearer
-	// key and the synthetic.new: selector, and the relayed usage keeps the
-	// client's own usage shape.
+	// key and the synthetic.new: selector, and the tools are the caller's
+	// function tools plus the proxy's own otari_web_search declaration.
 	resp, err := http.Post(addr+"/v1/chat/completions", "application/json",
-		strings.NewReader(`{"model":"zai-org/glm-5.3-flash","messages":[]}`))
+		strings.NewReader(`{"model":"zai-org/glm-5.3-flash","messages":[],"tools":[`+
+			`{"type":"function","function":{"name":"list_files"}},`+
+			`{"type":"otari_web_fetch"},`+
+			`{"type":"otari_web_search","max_uses":99}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,19 +217,18 @@ func TestProxyOtariTwoKeysEndToEnd(t *testing.T) {
 		t.Errorf("relayed usage.cost = %v, want %v (api_* list prices)", relayed.Usage.Cost, wantCost)
 	}
 
-	// A search call: the search endpoint sees the synthetic.new key.
+	// The old search endpoint is gone: /v2/search answers 404 (issue #2).
 	sresp, err := http.Post(addr+"/v2/search", "application/json", strings.NewReader(`{"query":"otari docs"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	searchBody, _ := io.ReadAll(sresp.Body)
+	_, _ = io.Copy(io.Discard, sresp.Body)
 	sresp.Body.Close()
-	if sresp.StatusCode != http.StatusOK {
-		t.Fatalf("search call: status %d, body:\n%s", sresp.StatusCode, searchBody)
+	if sresp.StatusCode != http.StatusNotFound {
+		t.Errorf("POST /v2/search: status %d, want 404 (the endpoint was removed)", sresp.StatusCode)
 	}
 
 	chatPaths, chatAuths, chatBodies := chat.snapshot()
-	searchPaths, searchAuths, _ := search.snapshot()
 
 	// The chat call reached the chat upstream at /chat/completions with the
 	// Otari key and the synthetic.new: selector model.
@@ -245,43 +241,49 @@ func TestProxyOtariTwoKeysEndToEnd(t *testing.T) {
 			}
 			var body struct {
 				Model string `json:"model"`
+				Tools []struct {
+					Type    string `json:"type"`
+					MaxUses int    `json:"max_uses"`
+				} `json:"tools"`
 			}
 			if err := json.Unmarshal([]byte(chatBodies[i]), &body); err != nil {
 				t.Errorf("chat upstream body %q: %v", chatBodies[i], err)
-			} else if body.Model != "synthetic.new:hf:zai-org/GLM-5.3-Flash" {
+				continue
+			}
+			if body.Model != "synthetic.new:hf:zai-org/GLM-5.3-Flash" {
 				t.Errorf("chat upstream model = %q, want %q", body.Model, "synthetic.new:hf:zai-org/GLM-5.3-Flash")
+			}
+			// The caller's function tool survives, the caller's otari_* tools
+			// do not, and the proxy declared exactly its own search tool with
+			// the configured per-call cap (issue #2).
+			if len(body.Tools) != 2 {
+				t.Errorf("chat upstream tools = %+v, want the function tool plus one otari_web_search", body.Tools)
+			} else {
+				if body.Tools[0].Type != "function" {
+					t.Errorf("chat upstream tools[0] = %+v, want the caller's function tool", body.Tools[0])
+				}
+				if body.Tools[1].Type != "otari_web_search" || body.Tools[1].MaxUses != 3 {
+					t.Errorf("chat upstream tools[1] = %+v, want otari_web_search max_uses 3", body.Tools[1])
+				}
 			}
 		}
 	}
 	if !sawChat {
 		t.Errorf("the chat upstream never saw a /chat/completions call; paths: %v", chatPaths)
 	}
-	// The search call reached the search endpoint (PROXY_SEARCH_URL is the
-	// endpoint itself, so the stub sees the root path) with the
-	// synthetic.new key.
-	if len(searchPaths) != 1 {
-		t.Errorf("search endpoint saw %d requests (%v), want exactly one", len(searchPaths), searchPaths)
-	} else if searchAuths[0] != "Bearer "+syntheticKey {
-		t.Errorf("search endpoint Authorization = %q, want %q", searchAuths[0], "Bearer "+syntheticKey)
-	}
-	// Neither key ever appears on the other endpoint, and no /v2/quotas
+	// The Otari key never appears anywhere it should not, and no /v2/quotas
 	// request is made (the stub serves one; it is never asked).
 	for i, auth := range chatAuths {
-		if strings.Contains(auth, syntheticKey) {
-			t.Errorf("the synthetic.new key reached the chat upstream: %q (path %s)", auth, chatPaths[i])
+		if strings.Contains(auth, "second-line-is-not-a-key") {
+			t.Errorf("the ignored second stdin line reached the chat upstream: %q (path %s)", auth, chatPaths[i])
 		}
 		if strings.HasSuffix(chatPaths[i], "/v2/quotas") {
 			t.Errorf("the proxy called /v2/quotas on the chat upstream; the quota guard is gone")
 		}
 	}
-	for i, auth := range searchAuths {
-		if strings.Contains(auth, otariKey) {
-			t.Errorf("the Otari key reached the search endpoint: %q (path %s)", auth, searchPaths[i])
-		}
-	}
 
-	// The ledger row records Otari's cost_usd for reference only, and the
-	// call's cost still comes from the api_* list prices.
+	// The ledger row records Otari's cost_usd, and the call's recorded cost
+	// is the larger of the api_* list prices and that figure (issue #2).
 	lines, err := readLedger(ledger)
 	if err != nil {
 		t.Fatal(err)
@@ -298,8 +300,14 @@ func TestProxyOtariTwoKeysEndToEnd(t *testing.T) {
 	if call.OtariCostUSD != 0.000085 {
 		t.Errorf("ledger otari_cost_usd = %v, want 0.000085", call.OtariCostUSD)
 	}
-	if call.CostUSD != wantCost {
-		t.Errorf("ledger cost_usd = %v, want %v (api_* list prices)", call.CostUSD, wantCost)
+	// Issue #2: a call is charged the larger of list-price tokens plus its
+	// searches and Otari's own cost_usd, so the recorded figure is that max.
+	wantLedgerCost := wantCost
+	if call.OtariCostUSD > wantLedgerCost {
+		wantLedgerCost = call.OtariCostUSD
+	}
+	if call.CostUSD != wantLedgerCost {
+		t.Errorf("ledger cost_usd = %v, want %v (max of api_* list prices and otari_cost_usd)", call.CostUSD, wantLedgerCost)
 	}
 }
 
@@ -327,9 +335,9 @@ func TestProxyStartFailsWithoutOtariKey(t *testing.T) {
 }
 
 // TestOtariCostUSDStreamedToLedger: a streamed response whose final usage
-// chunk carries cost_usd records otari_cost_usd in the ledger row, and cost
-// is still computed from the api_* list prices. A non-numeric or absurd
-// cost_usd is dropped, not recorded.
+// chunk carries cost_usd records otari_cost_usd in the ledger row, and the
+// recorded cost is the larger of the api_* list prices and that figure
+// (issue #2). A non-numeric or absurd cost_usd is dropped, not recorded.
 func TestOtariCostUSDStreamedToLedger(t *testing.T) {
 	costUSD := "0.000085"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -341,7 +349,7 @@ func TestOtariCostUSDStreamedToLedger(t *testing.T) {
 	defer upstream.Close()
 
 	ledger := filepath.Join(t.TempDir(), "ledger.jsonl")
-	p := &proxy{upstream: upstream.URL, apiKey: "otari-key", searchKey: "synthetic-key",
+	p := &proxy{upstream: upstream.URL, apiKey: "otari-key",
 		ledger: ledger, runCap: 5, weekCap: 20, models: []Model{otariFixtureModel()}, client: upstream.Client()}
 	server := httptest.NewServer(p)
 	defer server.Close()
@@ -390,8 +398,14 @@ func TestOtariCostUSDStreamedToLedger(t *testing.T) {
 		}
 	}
 	for i, call := range calls {
-		if call.CostUSD != wantCost {
-			t.Errorf("call %d: cost_usd = %v, want %v (api_* list prices)", i+1, call.CostUSD, wantCost)
+		// Issue #2: max(list-price tokens + searches, otari_cost_usd); these
+		// calls ran no searches, so it is max(wantCost, the recorded cost).
+		want := wantCost
+		if call.OtariCostUSD > want {
+			want = call.OtariCostUSD
+		}
+		if call.CostUSD != want {
+			t.Errorf("call %d: cost_usd = %v, want %v (max of api_* list prices and otari_cost_usd)", i+1, call.CostUSD, want)
 		}
 	}
 }
@@ -404,7 +418,7 @@ func TestOtariCostUSDStreamedToLedger(t *testing.T) {
 func TestRewriteRequestOtariSelector(t *testing.T) {
 	m := otariFixtureModel()
 	body := map[string]json.RawMessage{"model": json.RawMessage(`"` + m.ID + `"`)}
-	if _, err := RewriteRequest(body, m); err != nil {
+	if _, err := RewriteRequest(body, m, 0); err != nil {
 		t.Fatal(err)
 	}
 	var got string
@@ -440,7 +454,7 @@ func TestOtariGatewayControlsStripped(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	p := &proxy{upstream: upstream.URL, apiKey: "otari-key", searchKey: "synthetic-key",
+	p := &proxy{upstream: upstream.URL, apiKey: "otari-key",
 		ledger: filepath.Join(t.TempDir(), "ledger.jsonl"), runCap: 5, weekCap: 20,
 		models: []Model{otariFixtureModel()}, client: upstream.Client()}
 	server := httptest.NewServer(p)
@@ -569,7 +583,7 @@ func TestRewriteRequestAllowlistHardening(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	p := &proxy{upstream: upstream.URL, apiKey: "otari-key", searchKey: "synthetic-key",
+	p := &proxy{upstream: upstream.URL, apiKey: "otari-key",
 		ledger: filepath.Join(t.TempDir(), "ledger.jsonl"), runCap: 5, weekCap: 20,
 		models: []Model{otariFixtureModel()}, client: upstream.Client()}
 	server := httptest.NewServer(p)

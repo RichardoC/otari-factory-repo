@@ -105,11 +105,12 @@ maintainer's approval, like any other change under `.github/`.
     `min_credit_percent` quota floor is gone. The factory's own
     `run_credit_usd`/`weekly_credit_usd` caps stay as runaway guards;
 
-  Two keys are held only by the proxy, both passed in on stdin (line 1 the
-  Otari key, line 2 the synthetic.new key), never through the environment:
-  the Otari key (`OTARI_API_KEY` secret) is sent only to the chat upstream,
-  and the synthetic.new key (`SYNTHETIC_API_KEY` secret) only to the search
-  endpoint — neither key ever reaches the other host, and neither is logged.
+  One key is held only by the proxy, passed in on stdin (a single line),
+  never through the environment: the Otari key (`OTARI_API_KEY` secret),
+  sent only to hosted Otari — chat and web search (Otari's
+  `otari_web_search` tool, run inside the model call) both go there. The
+  factory no longer holds a synthetic.new API key at all, and the key is never
+  logged.
 - Model choice: the seats are spread across models. synthetic.new used to
   allow only 2 calls to each model at once; since the October 2026 pricing
   change concurrency is by plan priority instead, and the factory sets its
@@ -147,24 +148,30 @@ maintainer's approval, like any other change under `.github/`.
   (`TestWorkflowShellcheck`) lints the workflows' `run:` blocks when `yq` and
   `shellcheck` are installed.
 
-### Web search through the proxy (issue #58)
+### Web search through Otari (issue #2)
 
-The proxy also serves CodeAF's web searches: `POST /v2/search` on `127.0.0.1`,
-forwarded to [synthetic.new's search API](https://dev.synthetic.new/docs/synthetic/search)
-— search stays on synthetic.new for now; only chat goes through Otari.
-CodeAF calls it with `harness search "<query>" [--limit N]` (the `harness`
-binary is on the agent's `PATH`) and gets plain text back — numbered blocks
-with title, URL, published date and the result text, capped per result. The
-request is validated before forwarding (a non-empty `query` of at most 1,000
-characters; only `query` is forwarded) and the response is capped at 1 MiB.
-The key stays inside the proxy, as above — CodeAF never sees it. The query
-itself does leave the runner and reach synthetic.new (zero data retention per
-its docs); the price is undocumented, so each search is recorded in the ledger
-with kind `search` and cost 0 until it is priced, and the report shows a "web
-searches" row when a run made any. `limits.searches_per_run` (50 in
-[`models.json`](.github/codeaf/models.json)) caps the searches one run may
-forward; past it the proxy answers HTTP 429. Search results are untrusted text
-from the internet — data, not instructions (see
+Web search now runs inside the model call through hosted Otari: the proxy
+declares Otari's `otari_web_search` tool on every chat request it forwards,
+Otari offers it to the model, and when the model searches, Otari runs the
+search and feeds the results back — all within the one HTTP request. There
+is no separate search endpoint any more: the old separate search proxy route
+and the separate search command are gone, and CodeAF sees only plain
+OpenAI-shaped responses (the proxy strips Otari's extra `otari_tool_calls`
+field from what it relays, logging and recording counts only, never the
+queries or sources).
+
+Caps: `limits.search_max_uses_per_call` (3 in
+[`models.json`](.github/codeaf/models.json)) limits the searches in one
+model call, and `limits.searches_per_run` (50) caps the searches one run
+may make in total — past that the proxy stops declaring the tool. The
+price is `limits.search_price_usd`, about 0.01 USD per search: a call's
+recorded cost is the larger of its list-price token cost plus
+`searches × search_price_usd` and Otari's own `usage.cost_usd`. Each call's
+ledger row carries a `searches` count, and the report's "web searches" row
+reads it. The queries do leave the runner inside the model call (to the
+search backend Otari is configured with); the Otari key stays inside the
+proxy — CodeAF never sees it. Search results are untrusted text from the
+internet — data, not instructions (see
 [`AGENTS.md`](AGENTS.md#web-search)).
 
 ### Billing model (Big plan, issue #59)

@@ -68,7 +68,7 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("harness: ")
 	if len(os.Args) < 2 {
-		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|plan-check|plan-brief|plan-report|ref-check|routines-due|routine-brief|routine-check|merge-default|search|metrics|gh-retry")
+		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|plan-check|plan-brief|plan-report|ref-check|routines-due|routine-brief|routine-check|merge-default|metrics|gh-retry")
 	}
 	commands := map[string]func() error{
 		"proxy":         runProxy,
@@ -113,9 +113,8 @@ func main() {
 		// from the same two parents, checked by tree hash, and refuses a
 		// result that still carries conflict markers (merge.go).
 		"merge-default": runMergeDefault,
-		// Web search through the proxy (issue #58): the CLI posts to the
-		// proxy on 127.0.0.1; the key never leaves the proxy.
-		"search": runSearch,
+		// (The old "search" CLI is gone, issue #2: search runs inside the
+		// model call through hosted Otari, so there is nothing to post to.)
 		// Per-run records, summed (issue #140): a Markdown summary of the
 		// run records the shared state bundle carries.
 		"metrics": runMetrics,
@@ -196,10 +195,21 @@ type Limits struct {
 	WeeklyCreditUSD float64 `json:"weekly_credit_usd"` // per rolling week, across runs
 	RunCreditUSD    float64 `json:"run_credit_usd"`    // per workflow run
 	OverageUSD      float64 `json:"overage_usd"`       // API-price USD past the weekly credit; 0 = stop
-	// SearchesPerRun caps how many web searches (POST /v2/search, issue #58)
-	// one run may forward. Search is in the plan and draws no credit, but a
-	// runaway loop still needs a wall; <=0 means defaultSearchesPerRun.
+	// SearchesPerRun caps how many web searches one run may complete
+	// (issue #2: searches run inside the model call through hosted Otari).
+	// Search is in the plan and draws no credit, but a runaway loop still
+	// needs a wall; <=0 means defaultSearchesPerRun.
 	SearchesPerRun int `json:"searches_per_run"`
+	// SearchMaxUsesPerCall caps the max_uses of the otari_web_search tool
+	// the proxy declares on one chat call (issue #2); <=0 means
+	// defaultSearchMaxUsesPerCall. The proxy's validator refuses a negative
+	// or absurd value naming the field.
+	SearchMaxUsesPerCall int `json:"search_max_uses_per_call"`
+	// SearchPriceUSD is what one Otari search is billed at, on top of the
+	// call's list-price token cost (issue #2); <=0 means
+	// defaultSearchPriceUSD. The recorded cost is the larger of
+	// list-price tokens + searches x this and Otari's own cost_usd.
+	SearchPriceUSD float64 `json:"search_price_usd"`
 }
 
 // Alerts are the model-stats routine's thresholds (issue #131). They live
@@ -475,6 +485,28 @@ func loadConfig(path string) (Config, error) {
 	if cfg.Limits.OverageUSD < 0 {
 		return cfg, fmt.Errorf("%s: limits.overage_usd must not be negative", path)
 	}
+	// Web search through hosted Otari (issue #2): defaults field by field,
+	// so a models.json written before the fields existed still loads; a
+	// negative or absurd value is an error naming the field. max_uses is a
+	// count of searches in one call -- anything past maxSearchMaxUsesPerCall
+	// is a typo or a hostile edit, not a cap -- and a search priced above
+	// maxSearchPriceUSD would dwarf the call it rides on.
+	// searches_per_run keeps its issue #58 meaning: <= 0 means the default 50.
+	if cfg.Limits.SearchesPerRun <= 0 {
+		cfg.Limits.SearchesPerRun = defaultSearchesPerRun
+	}
+	switch {
+	case cfg.Limits.SearchMaxUsesPerCall == 0:
+		cfg.Limits.SearchMaxUsesPerCall = defaultSearchMaxUsesPerCall
+	case cfg.Limits.SearchMaxUsesPerCall < 0 || cfg.Limits.SearchMaxUsesPerCall > maxSearchMaxUsesPerCall:
+		return cfg, fmt.Errorf("%s: limits.search_max_uses_per_call must be between 1 and %d, got %d", path, maxSearchMaxUsesPerCall, cfg.Limits.SearchMaxUsesPerCall)
+	}
+	switch {
+	case cfg.Limits.SearchPriceUSD == 0:
+		cfg.Limits.SearchPriceUSD = defaultSearchPriceUSD
+	case cfg.Limits.SearchPriceUSD < 0 || cfg.Limits.SearchPriceUSD > maxSearchPriceUSD:
+		return cfg, fmt.Errorf("%s: limits.search_price_usd must be between 0 and %v, got %v", path, maxSearchPriceUSD, cfg.Limits.SearchPriceUSD)
+	}
 	// The queue defaults to two parallel runs; a negative value is a
 	// mistake, not a wish to run none.
 	switch {
@@ -727,10 +759,29 @@ func boundedUsage(m Model, u *Usage) (usage *Usage, dropped bool) {
 
 // ---------------------------------------------------------------- proxy
 
+// Web search through hosted Otari (issue #2): the proxy declares Otari's
+// own otari_web_search tool on every chat call, so the model searches inside
+// the call on the organisation's synthetic.new search key and the factory
+// carries no second secret. These are the caps' defaults when models.json
+// does not set limits.search_max_uses_per_call / limits.search_price_usd.
+const (
+	// defaultSearchesPerRun is the run's search budget when models.json
+	// leaves limits.searches_per_run unset (or <= 0), as it has been since
+	// issue #58; issue #2 spends it against searches Otari completed.
+	defaultSearchesPerRun       = 50
+	defaultSearchMaxUsesPerCall = 3
+	// maxSearchMaxUsesPerCall bounds the configured cap: more searches than
+	// this in one call is a typo or a hostile edit, not a cap.
+	maxSearchMaxUsesPerCall = 100
+	defaultSearchPriceUSD   = 0.01
+	// maxSearchPriceUSD bounds the configured per-search price: a search
+	// costing more than this would dwarf the call it rides on.
+	maxSearchPriceUSD = 1
+)
+
 type proxy struct {
 	upstream   string
 	apiKey     string // the Otari key, sent only to the chat upstream
-	searchKey  string // the synthetic.new key, sent only to the search endpoint
 	ledger     string
 	runCap     float64 // per-run credit cap (limits.run_credit_usd)
 	weekCap    float64 // weekly credit cap, shared across runs (limits.weekly_credit_usd)
@@ -745,16 +796,18 @@ type proxy struct {
 	heartbeatEvery time.Duration
 	// headerGrace overrides headerWaitGrace when set (tests shorten it).
 	headerGrace time.Duration
-	// Web search (issue #58): where forwarded searches go and this run's
-	// cap; searches counts this run's forwarded attempts under p.mu.
-	searchURL      string
+	// Web search (issue #2): the caps the tool declaration and the cost use.
+	// searchesPerRun is the run's completed-search cap, searchMaxUses the
+	// max_uses declared per call, searchPrice the per-search price.
 	searchesPerRun int
+	searchMaxUses  int
+	searchPrice    float64
 
 	mu         sync.Mutex
 	runSpent   float64 // credit spent by this run
 	overage    bool    // the weekly credit is exhausted; new calls are billed at API prices
 	overageApi float64 // API-price USD recorded past the weekly credit
-	searches   int     // web searches forwarded this run (issue #58); capped by searchesPerRun
+	searches   int     // web searches Otari completed for this run (issue #2); capped by searchesPerRun
 }
 
 func envFloat(name string, fallback float64) (float64, error) {
@@ -795,11 +848,10 @@ func upstreamClient() *http.Client {
 
 func runProxy() error {
 	p := &proxy{
-		upstream:  strings.TrimRight(envOr("PROXY_UPSTREAM", "https://eu.api.otari.ai/api/v1"), "/"),
-		apiKey:    os.Getenv("OTARI_API_KEY"),
-		searchKey: os.Getenv("SYNTHETIC_API_KEY"),
-		ledger:    envOr("PROXY_LEDGER", "codeaf-ledger.jsonl"),
-		client:    upstreamClient(),
+		upstream: strings.TrimRight(envOr("PROXY_UPSTREAM", "https://eu.api.otari.ai/api/v1"), "/"),
+		apiKey:   os.Getenv("OTARI_API_KEY"),
+		ledger:   envOr("PROXY_LEDGER", "codeaf-ledger.jsonl"),
+		client:   upstreamClient(),
 	}
 	cfg, err := loadConfig(configPath())
 	if err != nil {
@@ -810,36 +862,28 @@ func runProxy() error {
 	p.weekCap = cfg.Limits.WeeklyCreditUSD
 	p.overageCap = cfg.Limits.OverageUSD
 	p.slots = newSlots(p.models, cfg.Queue.MaxParallelRuns)
-	// Web search (issue #58): the endpoint to forward to and the per-run cap
-	// from models.json (<=0 means defaultSearchesPerRun in the handler).
-	p.searchURL = envOr("PROXY_SEARCH_URL", defaultSearchURL)
+	// Web search (issue #2): loadConfig applied the search-cap defaults.
 	p.searchesPerRun = cfg.Limits.SearchesPerRun
+	p.searchMaxUses = cfg.Limits.SearchMaxUsesPerCall
+	p.searchPrice = cfg.Limits.SearchPriceUSD
 	if p.weekSpent, err = spentWeek("PROXY_WEEK_SPENT_USD"); err != nil {
 		return err
 	}
-	// Preferred: the keys arrive on stdin, so they are never in the proxy's
+	// Preferred: the key arrives on stdin, so it is never in the proxy's
 	// process environment, which the CodeAF job (same user) could read.
-	// Line 1 is the Otari key (OTARI_API_KEY), line 2 the synthetic.new key
-	// (SYNTHETIC_API_KEY); an env fallback takes the place of the stdin line
-	// it replaces, and the stdin lines are still consumed in order. The
-	// Otari key is sent only to the chat upstream and the synthetic.new key
-	// only to the search endpoint; neither is ever logged.
-	if p.apiKey == "" || p.searchKey == "" {
+	// Line 1 is the Otari key (OTARI_API_KEY); an env fallback takes its
+	// place. It is the only key the proxy holds: chat and search both go
+	// through hosted Otari (issue #2), so there is no synthetic.new key any
+	// more. A second stdin line, left over from the two-key days, is read
+	// past and ignored. The key is sent only to the chat upstream and is
+	// never logged.
+	if p.apiKey == "" {
 		reader := bufio.NewReader(os.Stdin)
 		line1, _ := reader.ReadString('\n')
-		if p.apiKey == "" {
-			p.apiKey = strings.TrimSpace(line1)
-		}
-		if p.searchKey == "" {
-			line2, _ := reader.ReadString('\n')
-			p.searchKey = strings.TrimSpace(line2)
-		}
+		p.apiKey = strings.TrimSpace(line1)
 	}
 	if p.apiKey == "" {
 		return errors.New("no OTARI_API_KEY in the environment or on stdin")
-	}
-	if p.searchKey == "" {
-		return errors.New("no SYNTHETIC_API_KEY in the environment or on stdin")
 	}
 	addr := "127.0.0.1:" + envOr("PROXY_PORT", "8787")
 	log.Printf("proxy on %s -> %s (run credit cap $%.2f, weekly credit cap $%.2f, week spent $%.4f, overage cap $%.2f)", addr, p.upstream, p.runCap, p.weekCap, p.weekSpent, p.overageCap)
@@ -868,10 +912,6 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"week_spent_credit_usd": week, "overage_api_usd": over})
 	case r.Method == http.MethodPost && strings.HasSuffix(path, "/chat/completions"):
 		p.chat(w, r)
-	case r.Method == http.MethodPost && path == "/v2/search":
-		// Web search (issue #58): the exact path only; the key stays with
-		// the proxy (search.go).
-		p.search(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "not served by the codeaf proxy: "+r.Method+" "+path)
 	}
@@ -1211,7 +1251,15 @@ func mustNameObject(nameRaw json.RawMessage) json.RawMessage {
 // untrusted, and an allowlist cannot be bypassed the way a blocklist can --
 // and the tools and tool_choice are rebuilt in canonical function-only form
 // (stripOtariGatewayTools): the agent gets plain function tool calls only.
-func RewriteRequest(body map[string]json.RawMessage, m Model) (stream bool, err error) {
+// Issue #2: after the stripping, the proxy appends its own
+// {"type":"otari_web_search","max_uses":maxUses} to the tools array,
+// creating the array if absent, so the model can search inside the call
+// through Otari on the organisation's synthetic.new search key. maxUses is
+// min(limits.search_max_uses_per_call, the run's remaining searches), and 0
+// when nothing remains, in which case no tool is declared at all. The agent
+// cannot raise the cap or declare fetch or code execution: every otari_*
+// entry it sent was already dropped above, and this is the only declaration.
+func RewriteRequest(body map[string]json.RawMessage, m Model, searchMaxUses int) (stream bool, err error) {
 	if raw, ok := body["reasoning"]; ok {
 		var reasoning reasoningRequest
 		if json.Unmarshal(raw, &reasoning) == nil {
@@ -1221,6 +1269,7 @@ func RewriteRequest(body map[string]json.RawMessage, m Model) (stream bool, err 
 		}
 	}
 	stripOtariGatewayTools(body)
+	declareOtariWebSearch(body, searchMaxUses)
 	forward := make(map[string]json.RawMessage, len(body))
 	for _, key := range chatRequestKeys {
 		if raw, ok := body[key]; ok {
@@ -1258,6 +1307,33 @@ func RewriteRequest(body map[string]json.RawMessage, m Model) (stream bool, err 
 		body["stream_options"], _ = json.Marshal(options)
 	}
 	return stream, nil
+}
+
+// declareOtariWebSearch appends the proxy's own otari_web_search entry to the
+// request's tools array (issue #2), creating the array when the request had
+// none or stripOtariGatewayTools emptied it. maxUses <= 0 declares nothing:
+// with the run's search budget spent, the model gets no search tool at all.
+// The entry is marshalled from a struct, so its shape on the wire is exactly
+// {"type":"otari_web_search","max_uses":N}.
+func declareOtariWebSearch(body map[string]json.RawMessage, maxUses int) {
+	if maxUses <= 0 {
+		return
+	}
+	entry, err := json.Marshal(struct {
+		Type    string `json:"type"`
+		MaxUses int    `json:"max_uses"`
+	}{Type: "otari_web_search", MaxUses: maxUses})
+	if err != nil {
+		return
+	}
+	var tools []json.RawMessage
+	if raw, ok := body["tools"]; ok {
+		if json.Unmarshal(raw, &tools) != nil {
+			return // an unreadable tools array: forward it unchanged
+		}
+	}
+	tools = append(tools, entry)
+	body["tools"], _ = json.Marshal(tools)
 }
 
 // maxRepairBytes bounds the size of the messages array repairToolArgs will
@@ -1456,9 +1532,16 @@ type LedgerLine struct {
 	Kind     string `json:"kind,omitempty"`
 	// Search lines (kind "search", issue #58) carry the query's length in
 	// runes and how many results came back — never the query text, which
-	// must not land in the ledger.
+	// must not land in the ledger. (Kind "search" is history: since issue #2
+	// searches run inside the chat call and a call row carries Searches.)
 	QueryLen int `json:"query_len,omitempty"`
 	Results  int `json:"results,omitempty"`
+	// Searches is how many otari_web_search calls Otari completed inside
+	// this chat call (issue #2), counted from the response's
+	// otari_tool_calls, bounded to the max_uses the request declared, and
+	// charged at limits.search_price_usd on top of the list-price tokens
+	// (or superseded by Otari's own cost_usd when that is larger).
+	Searches int `json:"searches,omitempty"`
 	// Status is the upstream HTTP status when upstream answered with anything
 	// other than 200 (issue #140); 0 on a recorded call. The line is written
 	// as a marker (kind "status"), so every report figure that counts calls
@@ -1522,7 +1605,11 @@ func timingOf(started time.Time) callTiming {
 	return callTiming{Dur: time.Since(started)}
 }
 
-func (p *proxy) record(m Model, usage *Usage, usageDropped, stream bool, start time.Time, slotWait, headerWait time.Duration, chars charCounts, repaired, status int, timing callTiming) {
+// record's searches argument is how many otari_web_search calls Otari
+// completed inside this one chat call (issue #2), counted from the response's
+// otari_tool_calls by the relay that saw them and bounded to the max_uses the
+// request declared.
+func (p *proxy) record(m Model, usage *Usage, usageDropped, stream bool, start time.Time, slotWait, headerWait time.Duration, chars charCounts, repaired, status int, timing callTiming, searches int) {
 	line := LedgerLine{Time: time.Now().UTC(), Model: m.ID, Upstream: m.Upstream, Stream: stream,
 		Start: start.UTC(), SlotWaitS: slotWait.Seconds(), HeaderMs: headerWait.Milliseconds(),
 		ReasoningChars: chars.reasoning, OutputChars: chars.output, RepairedToolArgs: repaired,
@@ -1537,15 +1624,29 @@ func (p *proxy) record(m Model, usage *Usage, usageDropped, stream bool, start t
 		line.Kind = "status"
 		line.Status = status
 	}
+	line.Searches = searches
 	if usage != nil {
 		line.UsageSeen = true
 		line.PromptTokens, line.CachedTokens, line.CompletionTokens = usage.PromptTokens, usage.cached(), usage.CompletionTokens
-		line.CostUSD = usage.Cost
+		// Issue #2: the recorded cost is the larger of the list-price tokens
+		// plus this call's searches at limits.search_price_usd, and Otari's
+		// own cost_usd -- Otari's figure covers the search rounds and any
+		// loop rounds the token counts miss, so a call is charged the larger
+		// of the two rather than losing either.
+		line.CostUSD = usage.Cost + float64(searches)*p.searchPrice
+		if usage.OtariCostUSD > line.CostUSD {
+			line.CostUSD = usage.OtariCostUSD
+		}
 		line.APICostUSD = ApiCostOf(m, *usage)
 		line.OtariCostUSD = usage.OtariCostUSD
 		if n, ok := usage.reasoningTokens(); ok {
 			line.ReasoningTokens = &n
 		}
+	} else if searches > 0 {
+		// The searches ran and were counted from otari_tool_calls whether or
+		// not a usable usage block arrived, so they are charged even on a
+		// call whose usage was dropped (the tokens of it are not).
+		line.CostUSD = float64(searches) * p.searchPrice
 	} else if status == 0 && !usageDropped {
 		// A refused call has no usage by construction; only a 200 without
 		// usage is worth a warning. A block that arrived but was unusable
@@ -1555,6 +1656,10 @@ func (p *proxy) record(m Model, usage *Usage, usageDropped, stream bool, start t
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// The run's search total (issue #2): what chat reads to size the next
+	// call's max_uses and what the cap is spent against. The count itself
+	// was bounded to the declared max_uses by the relay that saw it.
+	p.searches += searches
 	// Overage accounting: a call that started once the weekly credit was
 	// already exhausted is billed at API prices, and its whole API cost
 	// counts against the overage cap — usage is not split mid-call. The
@@ -1619,6 +1724,21 @@ func (p *proxy) appendLedger(line any) {
 	}
 	defer f.Close()
 	_, _ = f.Write(append(data, '\n'))
+}
+
+// countSearches is how many web searches the ledger records (issue #2): the
+// searches count on call rows. Old ledgers carried one kind "search" line per
+// forwarded search instead; those still count, so a report over a mixed or
+// historical ledger stays right.
+func countSearches(lines []LedgerLine) int {
+	n := 0
+	for _, l := range lines {
+		if l.Kind == "search" {
+			n++
+		}
+		n += l.Searches
+	}
+	return n
 }
 
 // capString cuts s to at most max bytes, back to a UTF-8 rune boundary.
@@ -1720,7 +1840,7 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		// no cost and no timing of its own: kind "status", like a refusal
 		// from upstream.
 		started := time.Now()
-		p.record(m, nil, false, wantsStream(body), started, slotWait, 0, charCounts{}, 0, http.StatusPaymentRequired, timingOf(started))
+		p.record(m, nil, false, wantsStream(body), started, slotWait, 0, charCounts{}, 0, http.StatusPaymentRequired, timingOf(started), 0)
 		p.fail(w, out, http.StatusPaymentRequired, reason)
 		return
 	}
@@ -1730,7 +1850,15 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 	if repaired > 0 {
 		log.Printf("repaired %d invalid tool-call argument(s) for %s", repaired, m.Upstream)
 	}
-	stream, err := RewriteRequest(body, m)
+	// Issue #2: the run's remaining search budget, read under the same mutex
+	// the completed-search count is written under. 0 (budget spent) declares
+	// no search tool at all; otherwise the per-call cap is the smaller of
+	// limits.search_max_uses_per_call and what remains.
+	p.mu.Lock()
+	remaining := p.searchesPerRun - p.searches
+	p.mu.Unlock()
+	searchMaxUses := min(p.searchMaxUses, remaining)
+	stream, err := RewriteRequest(body, m, searchMaxUses)
 	if err != nil {
 		p.fail(w, out, http.StatusBadRequest, err.Error())
 		return
@@ -1741,9 +1869,9 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		p.fail(w, out, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// The Otari key authenticates the chat upstream, and only it: the
-	// synthetic.new key (p.searchKey) never reaches this request, and this
-	// key never reaches the search endpoint. Neither is ever logged.
+	// The Otari key authenticates the chat upstream and is the only key the
+	// proxy holds (issue #2): chat and search both go through hosted Otari,
+	// so there is no separate search endpoint or second key. It is never logged.
 	request.Header.Set("Authorization", "Bearer "+p.apiKey)
 	request.Header.Set("Content-Type", "application/json")
 	if stream {
@@ -1794,7 +1922,7 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		// The refusal goes in the ledger too (issue #140): a run whose
 		// upstream kept answering 429 costs real time, and the record
 		// counts it. No usage, no cost.
-		p.record(m, nil, false, stream, started, slotWait, headerWait, charCounts{}, repaired, response.StatusCode, timingOf(started))
+		p.record(m, nil, false, stream, started, slotWait, headerWait, charCounts{}, repaired, response.StatusCode, timingOf(started), 0)
 		if out == nil {
 			w.Header().Set("Content-Type", response.Header.Get("Content-Type"))
 			w.WriteHeader(response.StatusCode)
@@ -1807,7 +1935,7 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !stream {
-		p.relayJSON(w, response.Body, m, started, slotWait, headerWait, repaired)
+		p.relayJSON(w, response.Body, m, started, slotWait, headerWait, repaired, searchMaxUses)
 		return
 	}
 	if out == nil {
@@ -1826,7 +1954,7 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		<-ctx.Done()
 		response.Body.Close()
 	}()
-	p.relayStream(out, response.Body, m, started, slotWait, headerWait, repaired)
+	p.relayStream(out, response.Body, m, started, slotWait, headerWait, repaired, searchMaxUses)
 	stop()
 	cancel()
 }
@@ -2215,7 +2343,7 @@ func (p *proxy) acquire(ctx context.Context, m Model, beat func()) (func(), time
 // relayJSON relays a non-streaming answer and records it (issue #131): with no
 // streamed lines the whole upstream wait is the header wait, so TTFTMs equals
 // header_ms and there is no gap and no cut. DurMs is the call as a whole.
-func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, started time.Time, slotWait, headerWait time.Duration, repaired int) {
+func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, started time.Time, slotWait, headerWait time.Duration, repaired, searchMaxUses int) {
 	var payload map[string]json.RawMessage
 	err := json.NewDecoder(upstream).Decode(&payload)
 	if err == nil && payload == nil {
@@ -2235,9 +2363,19 @@ func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, st
 		// non-200 refusals. Without this the call is a phantom: it is in no
 		// ledger line, so the metered spend, the run record and the model
 		// stats all under-count it.
-		p.record(m, nil, false, false, started, slotWait, headerWait, charCounts{}, repaired, http.StatusBadGateway, timingOf(started))
+		p.record(m, nil, false, false, started, slotWait, headerWait, charCounts{}, repaired, http.StatusBadGateway, timingOf(started), 0)
 		writeError(w, http.StatusBadGateway, "upstream body: "+err.Error())
 		return
+	}
+	// Issue #2: Otari reports the searches it ran in a top-level
+	// otari_tool_calls field. Count the distinct completed ids (bounded to
+	// the max_uses this request declared), then strip the field, so CodeAF
+	// sees a plain OpenAI-shaped response. Neither the queries nor the
+	// sources are logged anywhere; only the count is recorded.
+	searches := 0
+	if raw, ok := payload["otari_tool_calls"]; ok {
+		searches = countCompletedSearches(raw, searchMaxUses)
+		delete(payload, "otari_tool_calls")
 	}
 	var usage *Usage
 	dropped := false
@@ -2262,7 +2400,7 @@ func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, st
 	}
 	payload["model"], _ = json.Marshal(m.ID)
 	p.record(m, usage, dropped, false, started, slotWait, headerWait, chars, repaired, 0,
-		callTiming{TTFT: headerWait, Dur: time.Since(started)})
+		callTiming{TTFT: headerWait, Dur: time.Since(started)}, searches)
 	writeJSON(w, http.StatusOK, payload)
 }
 
@@ -2274,10 +2412,19 @@ func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, st
 // unchanged (issue #410) -- so the stream relay asks record for no second
 // warning. The payload is decoded once, and the choices are read out of that
 // decode, so counting adds no second parse of the chunk.
-func RewriteChunk(data []byte, m Model, chars *charCounts) (out []byte, usage *Usage, dropped bool) {
+func RewriteChunk(data []byte, m Model, chars *charCounts) (out []byte, usage *Usage, dropped bool, searchIDs []string, empty bool) {
 	var chunk map[string]json.RawMessage
 	if json.Unmarshal(data, &chunk) != nil {
-		return data, nil, false
+		return data, nil, false, nil, false
+	}
+	// Issue #2: a streamed chunk may carry Otari's otari_tool_calls. Collect
+	// the ids that reached "completed" (the caller deduplicates across the
+	// whole stream and bounds the total), then strip the field: CodeAF sees
+	// plain OpenAI-shaped chunks, and the queries and sources never leave
+	// the proxy.
+	if raw, ok := chunk["otari_tool_calls"]; ok {
+		searchIDs = completedSearchIDs(raw)
+		delete(chunk, "otari_tool_calls")
 	}
 	chunk["model"], _ = json.Marshal(m.ID)
 	if raw, ok := chunk["usage"]; ok && string(raw) != "null" {
@@ -2298,11 +2445,96 @@ func RewriteChunk(data []byte, m Model, chars *charCounts) (out []byte, usage *U
 			chars.addChoices(choices, "delta")
 		}
 	}
+	empty = chunkEmptiedBySearchStrip(chunk)
 	out, err := json.Marshal(chunk)
 	if err != nil {
-		return data, usage, dropped
+		return data, usage, dropped, searchIDs, empty
 	}
-	return out, usage, dropped
+	return out, usage, dropped, searchIDs, empty
+}
+
+// chunkEmptiedBySearchStrip reports whether a chunk is nothing but envelope
+// now that otari_tool_calls has been stripped from it (issue #2): no choices,
+// no usage, and none of the error or future fields a client would need.
+// Such a chunk carried only the search report, so relaying it would hand
+// CodeAF an empty shell; it is dropped instead.
+func chunkEmptiedBySearchStrip(chunk map[string]json.RawMessage) bool {
+	envelope := map[string]bool{
+		"id": true, "object": true, "created": true, "model": true,
+		"system_fingerprint": true, "service_tier": true,
+	}
+	for key := range chunk {
+		// choices and usage are judged below, not here: an empty choices
+		// array is exactly the emptied shape this function looks for.
+		if key == "choices" || key == "usage" {
+			continue
+		}
+		if !envelope[key] {
+			return false
+		}
+	}
+	if raw, ok := chunk["choices"]; ok {
+		var choices []json.RawMessage
+		if json.Unmarshal(raw, &choices) != nil || len(choices) > 0 {
+			return false
+		}
+	}
+	if raw, ok := chunk["usage"]; ok && string(raw) != "null" {
+		return false
+	}
+	return true
+}
+
+// completedSearchIDs returns the id of every element of an otari_tool_calls
+// array whose exact "status" decodes to "completed" (issue #2). Malformed
+// entries -- not objects, no id, a non-string id -- are ignored: Otari's
+// reported tool calls are upstream data like everything else, and a count
+// built from junk would be junk.
+func completedSearchIDs(raw json.RawMessage) []string {
+	var items []json.RawMessage
+	if json.Unmarshal(raw, &items) != nil {
+		return nil
+	}
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		var entry map[string]json.RawMessage
+		if json.Unmarshal(item, &entry) != nil {
+			continue // one malformed entry ignores itself, not the array
+		}
+		if entry == nil {
+			continue
+		}
+		statusRaw, ok := entry["status"]
+		if !ok {
+			continue
+		}
+		if status, ok := exactString(statusRaw); !ok || status != "completed" {
+			continue
+		}
+		idRaw, ok := entry["id"]
+		if !ok {
+			continue
+		}
+		if id, ok := exactString(idRaw); ok && id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// countCompletedSearches counts the distinct otari_tool_calls ids that
+// reached "completed" (issue #2), bounded to 0..maxUses -- the proxy never
+// credits a call with more searches than the max_uses it declared on the
+// request, whatever upstream reports.
+func countCompletedSearches(raw json.RawMessage, maxUses int) int {
+	if maxUses <= 0 {
+		return 0
+	}
+	seen := map[string]bool{}
+	for _, id := range completedSearchIDs(raw) {
+		seen[id] = true
+	}
+	return min(len(seen), maxUses)
 }
 
 // relayStream relays the upstream SSE stream to the client, one line at a
@@ -2312,10 +2544,14 @@ func RewriteChunk(data []byte, m Model, chars *charCounts) (out []byte, usage *U
 // token. Comment and relayed lines share the sink's mutex, so they never
 // interleave mid-line, and the ticker goroutine is stopped and joined before
 // the call is recorded, so nothing is written after the stream ends.
-func (p *proxy) relayStream(out *sseSink, upstream io.Reader, m Model, started time.Time, slotWait, headerWait time.Duration, repaired int) {
+func (p *proxy) relayStream(out *sseSink, upstream io.Reader, m Model, started time.Time, slotWait, headerWait time.Duration, repaired, searchMaxUses int) {
 	out.commit()
 	var usage *Usage
 	var chars charCounts
+	// Issue #2: the distinct otari_tool_calls ids that reached "completed"
+	// across the whole stream, deduplicated here (chunks repeat them) and
+	// bounded to the declared max_uses at the end.
+	searchIDs := map[string]bool{}
 	// dropped records that a usage chunk arrived but could not be trusted
 	// (issue #410); boundedUsage already warned about it.
 	dropped := false
@@ -2381,11 +2617,20 @@ func (p *proxy) relayStream(out *sseSink, upstream io.Reader, m Model, started t
 			if data, ok := bytes.CutPrefix(trimmed, []byte("data:")); ok {
 				data = bytes.TrimSpace(data)
 				if len(data) > 0 && !bytes.Equal(data, []byte("[DONE]")) {
-					rewritten, found, badUsage := RewriteChunk(data, m, &chars)
+					rewritten, found, badUsage, ids, empty := RewriteChunk(data, m, &chars)
 					if found != nil {
 						usage = found
 					}
 					dropped = dropped || badUsage
+					for _, id := range ids {
+						searchIDs[id] = true
+					}
+					if empty {
+						// The chunk carried only the search report (issue
+						// #2); with the field stripped there is nothing left
+						// for CodeAF, so it is not relayed at all.
+						continue
+					}
 					trimmed = append([]byte("data: "), rewritten...)
 					// Issue #145: this is the first data line the wait for
 					// upstream was really about; the header-wait heartbeat
@@ -2416,8 +2661,9 @@ func (p *proxy) relayStream(out *sseSink, upstream io.Reader, m Model, started t
 	// Issue #131: cut is the loop leaving without a `data: [DONE]` line --
 	// upstream's error, a bare EOF, or the client going away and cancelling
 	// the body out from under the read.
+	searches := min(len(searchIDs), max(searchMaxUses, 0))
 	p.record(m, usage, dropped, true, started, slotWait, headerWait, chars, repaired, 0, callTiming{
-		TTFT: ttft, Dur: time.Since(started), MaxGap: timingGap, Cut: !sawDone})
+		TTFT: ttft, Dur: time.Since(started), MaxGap: timingGap, Cut: !sawDone}, searches)
 }
 
 // ---------------------------------------------------------------- GitHub

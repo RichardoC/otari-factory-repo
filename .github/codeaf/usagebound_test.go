@@ -60,7 +60,7 @@ func TestRelayJSONBoundsUsage(t *testing.T) {
 			p := &proxy{ledger: filepath.Join(t.TempDir(), "ledger.jsonl"), runCap: 5, weekCap: 20}
 			body := `{"choices":[{"message":{"content":"hi"}}],"model":"x","usage":` + tc.usage + `}`
 			w := httptest.NewRecorder()
-			p.relayJSON(w, strings.NewReader(body), m, time.Now(), 0, 0, 0)
+			p.relayJSON(w, strings.NewReader(body), m, time.Now(), 0, 0, 0, 0)
 			if w.Code != http.StatusOK {
 				t.Fatalf("caller saw %d %s, want the unchanged 200", w.Code, w.Body.String())
 			}
@@ -110,7 +110,7 @@ func TestRelayJSONPricesValidUsageExactlyAsBefore(t *testing.T) {
 	const usage = `{"prompt_tokens":1000,"completion_tokens":200,"prompt_tokens_details":{"cached_tokens":400}}`
 	p := &proxy{ledger: filepath.Join(t.TempDir(), "ledger.jsonl"), runCap: 5, weekCap: 20}
 	w := httptest.NewRecorder()
-	p.relayJSON(w, strings.NewReader(`{"choices":[{"message":{"content":"hi"}}],"model":"x","usage":`+usage+`}`), m, time.Now(), 0, 0, 0)
+	p.relayJSON(w, strings.NewReader(`{"choices":[{"message":{"content":"hi"}}],"model":"x","usage":`+usage+`}`), m, time.Now(), 0, 0, 0, 0)
 	if w.Code != http.StatusOK {
 		t.Fatalf("caller saw %d %s", w.Code, w.Body.String())
 	}
@@ -145,7 +145,7 @@ func TestRewriteChunkBoundsUsage(t *testing.T) {
 	for _, tc := range badUsageBlocks {
 		t.Run(tc.name, func(t *testing.T) {
 			chunk := []byte(`{"choices":[],"usage":` + tc.usage + `}`)
-			out, usage, dropped := RewriteChunk(chunk, m, &charCounts{})
+			out, usage, dropped, _, _ := RewriteChunk(chunk, m, &charCounts{})
 			if usage != nil || !dropped {
 				t.Fatalf("RewriteChunk returned usage %+v, dropped %v; want no usage and dropped for an unusable block", usage, dropped)
 			}
@@ -162,7 +162,7 @@ func TestRewriteChunkBoundsUsage(t *testing.T) {
 		})
 	}
 	// A valid chunk is still priced as today.
-	out, usage, dropped := RewriteChunk([]byte(`{"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":200,"prompt_tokens_details":{"cached_tokens":400}}}`), m, &charCounts{})
+	out, usage, dropped, _, _ := RewriteChunk([]byte(`{"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":200,"prompt_tokens_details":{"cached_tokens":400}}}`), m, &charCounts{})
 	if usage == nil || dropped || math.Abs(usage.Cost-0.001824) > 1e-12 {
 		t.Fatalf("valid chunk usage = %+v, want the priced block", usage)
 	}

@@ -122,15 +122,15 @@ func TestRecordOverageAccounting(t *testing.T) {
 	// The weekly credit runs out during the second call: the third is the
 	// first recorded as overage.
 	p := &proxy{ledger: filepath.Join(t.TempDir(), "l.jsonl"), runCap: 5, weekCap: 0.0003, overageCap: 0.0002}
-	p.record(m, &usage, false, false, time.Now(), 0, 0, charCounts{}, 0, 0, callTiming{})
+	p.record(m, &usage, false, false, time.Now(), 0, 0, charCounts{}, 0, 0, callTiming{}, 0)
 	if p.overage || p.overageApi != 0 {
 		t.Fatalf("first call counted as overage: overage=%v api=$%v", p.overage, p.overageApi)
 	}
-	p.record(m, &usage, false, false, time.Now(), 0, 0, charCounts{}, 0, 0, callTiming{})
+	p.record(m, &usage, false, false, time.Now(), 0, 0, charCounts{}, 0, 0, callTiming{}, 0)
 	if !p.overage || p.overageApi != 0 {
 		t.Fatalf("crossing call: overage=%v api=$%v, want the credit to run out with no overage yet", p.overage, p.overageApi)
 	}
-	p.record(m, &usage, false, false, time.Now(), 0, 0, charCounts{}, 0, 0, callTiming{})
+	p.record(m, &usage, false, false, time.Now(), 0, 0, charCounts{}, 0, 0, callTiming{}, 0)
 	if p.overageApi != 0.000206 {
 		t.Fatalf("overageApi = $%v, want $0.000206", p.overageApi)
 	}

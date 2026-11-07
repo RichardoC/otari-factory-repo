@@ -131,7 +131,7 @@ func TestEffortFor(t *testing.T) {
 func TestRewriteRequest(t *testing.T) {
 	flash := mustResolve(t, testModels(t), "zai-org/glm-5.3-flash")
 	var body map[string]json.RawMessage
-	raw := `{"model":"zai-org/glm-5.3-flash","stream":true,"reasoning":{"effort":"medium"},"provider":{"order":["x"]},"tools":[{"type":"function"}]}`
+	raw := `{"model":"zai-org/glm-5.3-flash","stream":true,"reasoning":{"effort":"medium"},"provider":{"order":["x"]},"tools":[{"type":"function","function":{"name":"list_files"}}]}`
 	if err := json.Unmarshal([]byte(raw), &body); err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestRewriteRequest(t *testing.T) {
 		"model":            `"synthetic.new:hf:zai-org/GLM-5.3-Flash"`,
 		"reasoning_effort": `"medium"`,
 		"stream_options":   `{"include_usage":true}`,
-		"tools":            `[{"type":"function"}]`,
+		"tools":            `[{"type":"function","function":{"name":"list_files"}}]`,
 	} {
 		if got := string(body[key]); got != want {
 			t.Errorf("%s = %s, want %s", key, got, want)

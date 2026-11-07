@@ -1019,50 +1019,186 @@ func EffortFor(m Model, reasoning reasoningRequest) string {
 	return m.Efforts[len(m.Efforts)-1]
 }
 
-// openRouterOnly are request fields synthetic.new does not understand.
-var openRouterOnly = []string{"provider", "transforms", "route", "models", "usage", "plugins", "include_reasoning", "reasoning"}
+// chatRequestKeys is the exact, case-sensitive allowlist of the top-level
+// request keys RewriteRequest forwards to Otari. The agent's request is
+// untrusted input, and Otari's chat API acts on gateway-only fields of its
+// own (mcp_servers, guardrails, tools_header, ...) and bills some of them
+// outside the factory's caps, so nothing else may reach it. A blocklist
+// cannot be trusted here: encoding/json matches struct and map keys
+// case-insensitively, so MCP_SERVERS or Mcp_Servers would slip past an
+// exact-key delete of mcp_servers. An allowlist of known-safe keys cannot
+// be bypassed that way -- anything not spelled exactly as below is dropped,
+// which also drops user, metadata, safety_identifier, web_search_options
+// and every mcp_*, guardrails, tools_header, max_tool_iterations and
+// session_label field. model, reasoning_effort, stream and stream_options
+// are on the list because the proxy itself sets or rewrites them below.
+var chatRequestKeys = []string{
+	"model", "messages", "tools", "tool_choice", "parallel_tool_calls",
+	"stream", "stream_options",
+	"temperature", "top_p", "max_tokens", "max_completion_tokens", "stop", "seed", "n",
+	"frequency_penalty", "presence_penalty", "logprobs", "top_logprobs", "response_format",
+	"reasoning_effort",
+}
 
-// otariGatewayOnly are request fields Otari's gateway acts on itself
-// (https://docs.otari.ai/otari/for-integrators/api-reference/chat.md):
-// MCP servers, guardrails and session/tool-iteration controls. An agent
-// request is untrusted input, so the proxy strips them all from every
-// forwarded body rather than letting the agent attach MCP server URLs and
-// tokens, guardrail endpoints or session labels to a factory call.
-var otariGatewayOnly = []string{"mcp_servers", "mcp_server_ids", "guardrails", "tools_header", "max_tool_iterations", "session_label"}
+// exactString decodes raw as a JSON string. A non-string (null, number,
+// object) is not a type or name and never matches.
+func exactString(raw json.RawMessage) (string, bool) {
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", false
+	}
+	return s, true
+}
 
-// stripOtariGatewayTools rewrites the request's tools array to the entries
-// whose type is "function". Everything else -- type "mcp", the otari_*
-// tools (otari_web_search, otari_web_fetch, otari_code_execution) and the
-// native aliases (code_execution, code_interpreter, code_execution_<date>,
-// web_search, web_search_<date>, web_search_preview, web_fetch_<date>) --
-// is a tool Otari runs server-side and bills outside the factory's caps,
-// so an agent must not be able to call for one. A tools value that is not
-// an array of objects is dropped whole. (Issue #2 will add the proxy's own
-// controlled otari_web_search entry after this stripping.)
+// hasFoldingDuplicate reports whether m holds another key that equals key
+// under Unicode case-folding -- the tool {"type":"function",
+// "TYPE":"otari_code_execution"} must not pass as a plain function just
+// because its exact "type" says so: Otari reads the lowercase key, and the
+// uppercase twin is how a case-insensitive decoder would be tricked.
+func hasFoldingDuplicate(m map[string]json.RawMessage, key string) bool {
+	for k := range m {
+		if k != key && strings.EqualFold(k, key) {
+			return true
+		}
+	}
+	return false
+}
+
+// stripOtariGatewayTools rebuilds the request's tools array and tool_choice
+// in canonical form. Every tool entry Otari runs server-side -- type "mcp",
+// the otari_* tools (otari_web_search, otari_web_fetch,
+// otari_code_execution) and the native aliases (code_execution,
+// code_interpreter, code_execution_<date>, web_search, web_search_<date>,
+// web_search_preview, web_fetch_<date>) -- is billed outside the factory's
+// caps, so an agent must not be able to call for one. A tool is kept only
+// when its exact "type" key decodes to "function", no other key equals
+// "type" under case-folding, and its exact "function" key holds a JSON
+// object; it is re-emitted as exactly {"type":"function","function":...},
+// so no smuggled field survives inside a kept entry. tool_choice follows
+// the tools: dropped when no tools remain; the "auto"/"none"/"required"
+// strings kept only while tools do; an object kept only when it names a
+// kept function tool, re-emitted canonically. (Issue #2 will add the
+// proxy's own controlled otari_web_search entry after this stripping.)
 func stripOtariGatewayTools(body map[string]json.RawMessage) {
-	raw, ok := body["tools"]
+	var keptNames map[string]bool
+	if raw, ok := body["tools"]; ok {
+		var tools []json.RawMessage
+		kept := make([]json.RawMessage, 0, 8)
+		keptNames = map[string]bool{}
+		if json.Unmarshal(raw, &tools) == nil {
+			for _, tool := range tools {
+				var entry map[string]json.RawMessage
+				if json.Unmarshal(tool, &entry) != nil {
+					continue
+				}
+				typRaw, ok := entry["type"]
+				if !ok || hasFoldingDuplicate(entry, "type") {
+					continue
+				}
+				if typ, ok := exactString(typRaw); !ok || typ != "function" {
+					continue
+				}
+				fnRaw, ok := entry["function"]
+				if !ok {
+					continue
+				}
+				var fn map[string]json.RawMessage
+				if json.Unmarshal(fnRaw, &fn) != nil {
+					continue
+				}
+				canonical, err := json.Marshal(struct {
+					Type     string          `json:"type"`
+					Function json.RawMessage `json:"function"`
+				}{Type: "function", Function: fnRaw})
+				if err != nil {
+					continue
+				}
+				kept = append(kept, canonical)
+				if nameRaw, ok := fn["name"]; ok {
+					if name, ok := exactString(nameRaw); ok {
+						keptNames[name] = true
+					}
+				}
+			}
+		}
+		if len(kept) == 0 {
+			delete(body, "tools")
+		} else {
+			body["tools"], _ = json.Marshal(kept)
+		}
+	}
+	choice, ok := body["tool_choice"]
 	if !ok {
 		return
 	}
-	var tools []json.RawMessage
-	if json.Unmarshal(raw, &tools) != nil {
-		delete(body, "tools")
+	if len(keptNames) == 0 {
+		delete(body, "tool_choice")
 		return
 	}
-	functions := make([]json.RawMessage, 0, len(tools))
-	for _, tool := range tools {
-		var t struct {
-			Type string `json:"type"`
+	var s string
+	if json.Unmarshal(choice, &s) == nil {
+		if s != "auto" && s != "none" && s != "required" {
+			delete(body, "tool_choice")
 		}
-		if json.Unmarshal(tool, &t) == nil && t.Type == "function" {
-			functions = append(functions, tool)
-		}
-	}
-	if len(functions) == 0 {
-		delete(body, "tools")
 		return
 	}
-	body["tools"], _ = json.Marshal(functions)
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(choice, &obj) != nil {
+		delete(body, "tool_choice")
+		return
+	}
+	typRaw, ok := obj["type"]
+	if !ok || hasFoldingDuplicate(obj, "type") {
+		delete(body, "tool_choice")
+		return
+	}
+	typ, ok := exactString(typRaw)
+	if !ok || typ != "function" {
+		delete(body, "tool_choice")
+		return
+	}
+	fnRaw, ok := obj["function"]
+	if !ok {
+		delete(body, "tool_choice")
+		return
+	}
+	var fn map[string]json.RawMessage
+	if json.Unmarshal(fnRaw, &fn) != nil {
+		delete(body, "tool_choice")
+		return
+	}
+	nameRaw, ok := fn["name"]
+	if !ok {
+		delete(body, "tool_choice")
+		return
+	}
+	name, ok := exactString(nameRaw)
+	if !ok || !keptNames[name] {
+		delete(body, "tool_choice")
+		return
+	}
+	canonical, err := json.Marshal(struct {
+		Type     string          `json:"type"`
+		Function json.RawMessage `json:"function"`
+	}{Type: "function", Function: mustNameObject(nameRaw)})
+	if err != nil {
+		delete(body, "tool_choice")
+		return
+	}
+	body["tool_choice"] = canonical
+}
+
+// mustNameObject wraps a JSON string in {"name": <raw>}, the canonical
+// function object of a tool_choice. mustNameObject is only called with raw
+// values exactString has already decoded, so the marshal cannot fail.
+func mustNameObject(nameRaw json.RawMessage) json.RawMessage {
+	out, err := json.Marshal(struct {
+		Name json.RawMessage `json:"name"`
+	}{Name: nameRaw})
+	if err != nil {
+		return json.RawMessage("{}")
+	}
+	return out
 }
 
 // RewriteRequest rewrites a chat request for hosted Otari, which fronts the
@@ -1070,9 +1206,11 @@ func stripOtariGatewayTools(body map[string]json.RawMessage) {
 // provider:model selector, and the provider is named "synthetic.new", so the
 // model sent upstream is "synthetic.new:" + the synthetic.new model id
 // (models.json's upstream field) -- e.g. synthetic.new:hf:zai-org/GLM-5.3-Flash
-// -- which pins the call to the synthetic.new provider key. Otari's own
-// gateway-only fields and tools are stripped from the body (otariGatewayOnly,
-// stripOtariGatewayTools): the agent gets plain function tool calls only.
+// -- which pins the call to the synthetic.new provider key. The body is then
+// rebuilt from the chatRequestKeys allowlist -- the agent's request is
+// untrusted, and an allowlist cannot be bypassed the way a blocklist can --
+// and the tools and tool_choice are rebuilt in canonical function-only form
+// (stripOtariGatewayTools): the agent gets plain function tool calls only.
 func RewriteRequest(body map[string]json.RawMessage, m Model) (stream bool, err error) {
 	if raw, ok := body["reasoning"]; ok {
 		var reasoning reasoningRequest
@@ -1082,13 +1220,20 @@ func RewriteRequest(body map[string]json.RawMessage, m Model) (stream bool, err 
 			}
 		}
 	}
-	for _, key := range openRouterOnly {
-		delete(body, key)
-	}
-	for _, key := range otariGatewayOnly {
-		delete(body, key)
-	}
 	stripOtariGatewayTools(body)
+	forward := make(map[string]json.RawMessage, len(body))
+	for _, key := range chatRequestKeys {
+		if raw, ok := body[key]; ok {
+			forward[key] = raw
+		}
+	}
+	for key := range body {
+		delete(body, key)
+	}
+	for key, raw := range forward {
+		body[key] = raw
+	}
+	body["model"], _ = json.Marshal("synthetic.new:" + m.Upstream)
 	body["model"], _ = json.Marshal("synthetic.new:" + m.Upstream)
 	if raw, ok := body["stream"]; ok {
 		_ = json.Unmarshal(raw, &stream)

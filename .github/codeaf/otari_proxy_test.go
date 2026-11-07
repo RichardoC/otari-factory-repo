@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -544,4 +545,186 @@ func TestOtariGatewayControlsStripped(t *testing.T) {
 // provider key "synthetic.new" plus the synthetic.new model id.
 func otariSelector(upstream string) string {
 	return "synthetic.new:" + upstream
+}
+
+// TestRewriteRequestAllowlistHardening: encoding/json matches keys
+// case-insensitively, so the earlier blocklist stripping was bypassable --
+// {"type":"otari_web_search","Type":"function"} decoded as a plain function
+// and was forwarded with its original bytes, and MCP_SERVERS slipped past an
+// exact-key delete of mcp_servers. RewriteRequest now rebuilds the body from
+// the exact, case-sensitive chatRequestKeys allowlist and the tools and
+// tool_choice in canonical form, none of which can be bypassed that way.
+// Each request below is posted through the proxy and the exact body the
+// upstream stub receives is compared field for field.
+func TestRewriteRequestAllowlistHardening(t *testing.T) {
+	var mu sync.Mutex
+	var upstreamBodies []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		upstreamBodies = append(upstreamBodies, string(body))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer upstream.Close()
+
+	p := &proxy{upstream: upstream.URL, apiKey: "otari-key", searchKey: "synthetic-key",
+		ledger: filepath.Join(t.TempDir(), "ledger.jsonl"), runCap: 5, weekCap: 20,
+		models: []Model{otariFixtureModel()}, client: upstream.Client()}
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	post := func(body string) map[string]any {
+		t.Helper()
+		resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		mu.Lock()
+		raw := upstreamBodies[len(upstreamBodies)-1]
+		mu.Unlock()
+		var got map[string]any
+		if err := json.Unmarshal([]byte(raw), &got); err != nil {
+			t.Fatalf("upstream body %s: %v", raw, err)
+		}
+		return got
+	}
+	want := func(expected string) map[string]any {
+		t.Helper()
+		var m map[string]any
+		if err := json.Unmarshal([]byte(expected), &m); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	sameBody := func(got map[string]any, expected string) {
+		t.Helper()
+		if !reflect.DeepEqual(got, want(expected)) {
+			t.Errorf("upstream body\n got %s\nwant %s", got, expected)
+		}
+	}
+	noSmuggledKeys := func(body string, keys ...string) {
+		t.Helper()
+		for _, key := range keys {
+			if strings.Contains(body, key) {
+				t.Errorf("smuggled key %q reached the upstream: %s", key, body)
+			}
+		}
+	}
+
+	// Every bypass shape at once: the case-variant type tool, a tool with
+	// both "type":"function" and a folded "TYPE" naming a server-side tool,
+	// uppercase and mixed-case top-level gateway fields, and every field the
+	// allowlist does not name. Only the one ordinary function tool and the
+	// allowlisted fields may arrive.
+	post(`{` +
+		`"model":"zai-org/glm-5.3-flash",` +
+		`"messages":[{"role":"user","content":"hi"}],` +
+		`"tools":[` +
+		`{"type":"otari_web_search","Type":"function"},` +
+		`{"type":"function","TYPE":"otari_code_execution","function":{"name":"steal"}},` +
+		`{"type":"function","function":{"name":"list_files","parameters":{"type":"object"}}}` +
+		`],` +
+		`"tool_choice":{"type":"function","function":{"name":"otari_web_search"}},` +
+		`"MCP_SERVERS":[{"url":"https://evil.example/mcp"}],` +
+		`"Mcp_Servers":[{"url":"https://evil.example/mcp"}],` +
+		`"Guardrails":[{"url":"https://evil.example/guard"}],` +
+		`"web_search_options":{"search_context_size":"high"},` +
+		`"user":"agent-123",` +
+		`"metadata":{"run":"1"},` +
+		`"safety_identifier":"agent-123",` +
+		`"mcp_servers":[{"url":"https://evil.example/mcp"}],` +
+		`"mcp_server_ids":["srv_1"],` +
+		`"guardrails":[{"url":"https://evil.example/guard"}],` +
+		`"tools_header":{"x-evil":"1"},` +
+		`"max_tool_iterations":99,` +
+		`"session_label":"sneaky",` +
+		`"provider":{"order":["x"]},` +
+		`"reasoning":{"effort":"medium"}}`)
+	mu.Lock()
+	raw := upstreamBodies[len(upstreamBodies)-1]
+	mu.Unlock()
+	noSmuggledKeys(raw, "otari_web_search", "otari_code_execution", "steal", "MCP_SERVERS",
+		"Mcp_Servers", "Guardrails", "web_search_options", "agent-123", "safety_identifier",
+		"mcp_servers", "mcp_server_ids", "guardrails", "tools_header", "max_tool_iterations",
+		"session_label", "provider")
+	sameBody(post(`{`+
+		`"model":"zai-org/glm-5.3-flash",`+
+		`"messages":[{"role":"user","content":"hi"}],`+
+		`"tools":[`+
+		`{"type":"otari_web_search","Type":"function"},`+
+		`{"type":"function","TYPE":"otari_code_execution","function":{"name":"steal"}},`+
+		`{"type":"function","function":{"name":"list_files","parameters":{"type":"object"}}}`+
+		`],`+
+		`"tool_choice":{"type":"function","function":{"name":"otari_web_search"}},`+
+		`"MCP_SERVERS":[{"url":"https://evil.example/mcp"}],`+
+		`"Mcp_Servers":[{"url":"https://evil.example/mcp"}],`+
+		`"Guardrails":[{"url":"https://evil.example/guard"}],`+
+		`"web_search_options":{"search_context_size":"high"},`+
+		`"user":"agent-123",`+
+		`"metadata":{"run":"1"},`+
+		`"safety_identifier":"agent-123",`+
+		`"mcp_servers":[{"url":"https://evil.example/mcp"}],`+
+		`"mcp_server_ids":["srv_1"],`+
+		`"guardrails":[{"url":"https://evil.example/guard"}],`+
+		`"tools_header":{"x-evil":"1"},`+
+		`"max_tool_iterations":99,`+
+		`"session_label":"sneaky",`+
+		`"provider":{"order":["x"]},`+
+		`"reasoning":{"effort":"medium"}}`),
+		`{"model":"synthetic.new:hf:zai-org/GLM-5.3-Flash",`+
+			`"messages":[{"role":"user","content":"hi"}],`+
+			`"tools":[{"type":"function","function":{"name":"list_files","parameters":{"type":"object"}}}],`+
+			`"reasoning_effort":"medium"}`)
+
+	// tool_choice follows the tools: the strings stay while tools remain,
+	// a choice naming a kept tool is rebuilt canonically, and both are
+	// dropped when no tools survive (including when none were sent).
+	sameBody(post(`{"model":"zai-org/glm-5.3-flash","messages":[],"tools":[{"type":"function","function":{"name":"list_files"}}],"tool_choice":"required"}`),
+		`{"model":"synthetic.new:hf:zai-org/GLM-5.3-Flash","messages":[],"tools":[{"type":"function","function":{"name":"list_files"}}],"tool_choice":"required"}`)
+	// A tool_choice with a folded "TYPE" twin is as untrustworthy as such a
+	// tool, so it is dropped outright, like the tool would be; a clean
+	// choice naming a kept tool is rebuilt canonically, its extra fields gone.
+	sameBody(post(`{"model":"zai-org/glm-5.3-flash","messages":[],"tools":[{"type":"function","function":{"name":"list_files"}}],"tool_choice":{"type":"function","function":{"name":"list_files","smuggled":"x"},"TYPE":"otari_web_search"}}`),
+		`{"model":"synthetic.new:hf:zai-org/GLM-5.3-Flash","messages":[],"tools":[{"type":"function","function":{"name":"list_files"}}]}`)
+	sameBody(post(`{"model":"zai-org/glm-5.3-flash","messages":[],"tools":[{"type":"function","function":{"name":"list_files"}}],"tool_choice":{"type":"function","function":{"name":"list_files","smuggled":"x"}}}`),
+		`{"model":"synthetic.new:hf:zai-org/GLM-5.3-Flash","messages":[],"tools":[{"type":"function","function":{"name":"list_files"}}],"tool_choice":{"type":"function","function":{"name":"list_files"}}}`)
+	sameBody(post(`{"model":"zai-org/glm-5.3-flash","messages":[],"tools":[{"type":"otari_web_fetch"}],"tool_choice":"required"}`),
+		`{"model":"synthetic.new:hf:zai-org/GLM-5.3-Flash","messages":[]}`)
+	sameBody(post(`{"model":"zai-org/glm-5.3-flash","messages":[],"tool_choice":"required"}`),
+		`{"model":"synthetic.new:hf:zai-org/GLM-5.3-Flash","messages":[]}`)
+
+	// An ordinary CodeAF request -- messages, a function tool, stream,
+	// stream_options, reasoning effort and the plain sampling fields -- must
+	// reach the stub with the same meaning: every allowlisted field passes
+	// through, stream_options gains include_usage, and the model gets the
+	// Otari selector.
+	sameBody(post(`{`+
+		`"model":"zai-org/glm-5.3-flash",`+
+		`"messages":[{"role":"user","content":"list the files"}],`+
+		`"tools":[{"type":"function","function":{"name":"list_files","parameters":{"type":"object"}}}],`+
+		`"tool_choice":"auto",`+
+		`"parallel_tool_calls":true,`+
+		`"stream":true,`+
+		`"stream_options":{"include_usage":true},`+
+		`"temperature":0.7,"top_p":0.9,"max_tokens":1024,"max_completion_tokens":2048,`+
+		`"stop":["\n"],"seed":7,"n":1,`+
+		`"frequency_penalty":0.1,"presence_penalty":0.2,"logprobs":true,"top_logprobs":3,`+
+		`"response_format":{"type":"text"},`+
+		`"reasoning":{"effort":"medium"}}`),
+		`{"model":"synthetic.new:hf:zai-org/GLM-5.3-Flash",`+
+			`"messages":[{"role":"user","content":"list the files"}],`+
+			`"tools":[{"type":"function","function":{"name":"list_files","parameters":{"type":"object"}}}],`+
+			`"tool_choice":"auto",`+
+			`"parallel_tool_calls":true,`+
+			`"stream":true,`+
+			`"stream_options":{"include_usage":true},`+
+			`"temperature":0.7,"top_p":0.9,"max_tokens":1024,"max_completion_tokens":2048,`+
+			`"stop":["\n"],"seed":7,"n":1,`+
+			`"frequency_penalty":0.1,"presence_penalty":0.2,"logprobs":true,"top_logprobs":3,`+
+			`"response_format":{"type":"text"},`+
+			`"reasoning_effort":"medium"}`)
 }

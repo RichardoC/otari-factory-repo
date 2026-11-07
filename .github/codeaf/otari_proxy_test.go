@@ -443,6 +443,7 @@ func TestRewriteRequestDropsReservedWebSearchFunction(t *testing.T) {
 		"tools": json.RawMessage(`[
 			{"type":"function","function":{"name":"web_search","parameters":{"type":"object"}}},
 			{"type":"function","function":{"name":"Web_Search","parameters":{"type":"object"}}},
+			{"type":"function","function":{"name":" web_search","parameters":{"type":"object"}}},
 			{"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}
 		]`),
 		"tool_choice": json.RawMessage(`{"type":"function","function":{"name":"web_search"}}`),
@@ -787,4 +788,66 @@ func TestRewriteRequestAllowlistHardening(t *testing.T) {
 			`"frequency_penalty":0.1,"presence_penalty":0.2,"logprobs":true,"top_logprobs":3,`+
 			`"response_format":{"type":"text"},`+
 			`"reasoning_effort":"medium"}`)
+}
+
+// TestRewriteRequestDropsNullFunctionTool (issue #11): a tool whose
+// "function" is JSON null unmarshals into a nil map without an error, but it
+// is not the JSON object the function must hold, so it is dropped rather than
+// forwarded as {"type":"function","function":null}.
+func TestRewriteRequestDropsNullFunctionTool(t *testing.T) {
+	m := otariFixtureModel()
+	body := map[string]json.RawMessage{
+		"model": json.RawMessage(`"` + m.ID + `"`),
+		"tools": json.RawMessage(`[
+			{"type":"function","function":null},
+			{"type":"function","function":{"name":"list_files"}}
+		]`),
+	}
+	if _, err := RewriteRequest(body, m, 0); err != nil {
+		t.Fatal(err)
+	}
+	var tools []struct {
+		Type     string          `json:"type"`
+		Function json.RawMessage `json:"function"`
+	}
+	if err := json.Unmarshal(body["tools"], &tools); err != nil {
+		t.Fatalf("tools %s: %v", body["tools"], err)
+	}
+	if len(tools) != 1 || string(tools[0].Function) != `{"name":"list_files"}` {
+		t.Errorf("forwarded tools = %s, want only the list_files function", body["tools"])
+	}
+}
+
+// TestRewriteRequestRebuildsStreamOptions (issue #11): stream_options is
+// rebuilt as exactly {"include_usage":true} on a streamed request -- a
+// sub-key such as "x" and a written include_usage:false never reach upstream
+// -- and dropped entirely when stream is false or absent.
+func TestRewriteRequestRebuildsStreamOptions(t *testing.T) {
+	m := otariFixtureModel()
+	rewrite := func(t *testing.T, raw string) map[string]json.RawMessage {
+		t.Helper()
+		var body map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(raw), &body); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := RewriteRequest(body, m, 0); err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+
+	body := rewrite(t, `{"model":"`+m.ID+`","stream":true,"stream_options":{"x":1,"include_usage":false}}`)
+	if got := string(body["stream_options"]); got != `{"include_usage":true}` {
+		t.Errorf("streamed stream_options = %s, want {\"include_usage\":true}", got)
+	}
+
+	body = rewrite(t, `{"model":"`+m.ID+`","stream":false,"stream_options":{"x":1,"include_usage":true}}`)
+	if raw, ok := body["stream_options"]; ok {
+		t.Errorf("non-streaming stream_options reached the body: %s", raw)
+	}
+
+	body = rewrite(t, `{"model":"`+m.ID+`","stream_options":{"x":1,"include_usage":true}}`)
+	if raw, ok := body["stream_options"]; ok {
+		t.Errorf("stream-less stream_options reached the body: %s", raw)
+	}
 }

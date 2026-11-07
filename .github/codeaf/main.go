@@ -206,8 +206,9 @@ type Limits struct {
 	// or absurd value naming the field.
 	SearchMaxUsesPerCall int `json:"search_max_uses_per_call"`
 	// SearchPriceUSD is what one Otari search is billed at, on top of the
-	// call's list-price token cost (issue #2); <=0 means
-	// defaultSearchPriceUSD. The recorded cost is the larger of
+	// call's list-price token cost (issue #2). A written 0 is a real price
+	// meaning free; only an absent field means defaultSearchPriceUSD
+	// (issue #11). The recorded cost is the larger of
 	// list-price tokens + searches x this and Otari's own cost_usd.
 	SearchPriceUSD float64 `json:"search_price_usd"`
 }
@@ -476,6 +477,18 @@ func loadConfig(path string) (Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return cfg, fmt.Errorf("%s: %w", path, err)
 	}
+	// search_price_usd's zero value is a real price (free) since issue #11,
+	// and encoding/json cannot tell a written 0 from an absent field, so a
+	// second, pointer-shaped probe reads whether the key is there at all.
+	// Absent means the default price; a written 0 stays 0.
+	var optional struct {
+		Limits struct {
+			SearchPriceUSD *float64 `json:"search_price_usd"`
+		} `json:"limits"`
+	}
+	if err := json.Unmarshal(data, &optional); err != nil {
+		return cfg, fmt.Errorf("%s: %w", path, err)
+	}
 	if cfg.Limits.Plan == "" {
 		return cfg, fmt.Errorf("%s: limits.plan must be set", path)
 	}
@@ -490,7 +503,8 @@ func loadConfig(path string) (Config, error) {
 	// negative or absurd value is an error naming the field. max_uses is a
 	// count of searches in one call -- anything past maxSearchMaxUsesPerCall
 	// is a typo or a hostile edit, not a cap -- and a search priced above
-	// maxSearchPriceUSD would dwarf the call it rides on.
+	// maxSearchPriceUSD would dwarf the call it rides on. A written 0 price
+	// is free; only an absent search_price_usd takes the default.
 	// searches_per_run keeps its issue #58 meaning: <= 0 means the default 50.
 	if cfg.Limits.SearchesPerRun <= 0 {
 		cfg.Limits.SearchesPerRun = defaultSearchesPerRun
@@ -502,7 +516,7 @@ func loadConfig(path string) (Config, error) {
 		return cfg, fmt.Errorf("%s: limits.search_max_uses_per_call must be between 1 and %d, got %d", path, maxSearchMaxUsesPerCall, cfg.Limits.SearchMaxUsesPerCall)
 	}
 	switch {
-	case cfg.Limits.SearchPriceUSD == 0:
+	case optional.Limits.SearchPriceUSD == nil:
 		cfg.Limits.SearchPriceUSD = defaultSearchPriceUSD
 	case cfg.Limits.SearchPriceUSD < 0 || cfg.Limits.SearchPriceUSD > maxSearchPriceUSD:
 		return cfg, fmt.Errorf("%s: limits.search_price_usd must be between 0 and %v, got %v", path, maxSearchPriceUSD, cfg.Limits.SearchPriceUSD)
@@ -808,6 +822,39 @@ type proxy struct {
 	overage    bool    // the weekly credit is exhausted; new calls are billed at API prices
 	overageApi float64 // API-price USD recorded past the weekly credit
 	searches   int     // web searches Otari completed for this run (issue #2); capped by searchesPerRun
+	// reserved is the sum of the max_uses declared by calls still in flight
+	// (issue #11). chat adds a call's declaration under mu before the
+	// request is forwarded and releases it when the call ends, so a burst
+	// of concurrent calls cannot each spend the same remaining budget.
+	reserved int
+}
+
+// reserveSearches returns the max_uses a new call may declare and records it
+// as in flight (issue #11). The completed count only rises in record, when a
+// call ends, so reading it alone lets a burst of concurrent calls each
+// declare the full per-call cap and overshoot searches_per_run. Subtracting
+// the in-flight reservation as well makes the run's outstanding commitments
+// (completed + reserved) never exceed the cap. 0 means the budget is gone and
+// no search tool is declared.
+func (p *proxy) reserveSearches() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	remaining := p.searchesPerRun - p.searches - p.reserved
+	declared := min(p.searchMaxUses, max(remaining, 0))
+	p.reserved += declared
+	return declared
+}
+
+// releaseSearches ends one reservation once its call is recorded, freeing
+// what the call did not spend for the next call. The completed count was
+// already added by record.
+func (p *proxy) releaseSearches(declared int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.reserved -= declared
+	if p.reserved < 0 {
+		p.reserved = 0
+	}
 }
 
 func envFloat(name string, fallback float64) (float64, error) {
@@ -1117,8 +1164,8 @@ func hasFoldingDuplicate(m map[string]json.RawMessage, key string) bool {
 // so no smuggled field survives inside a kept entry. tool_choice follows
 // the tools: dropped when no tools remain; the "auto"/"none"/"required"
 // strings kept only while tools do; an object kept only when it names a
-// kept function tool, re-emitted canonically. (Issue #2 will add the
-// proxy's own controlled otari_web_search entry after this stripping.)
+// kept function tool, re-emitted canonically. (Issue #2 adds the proxy's
+// own controlled otari_web_search entry after this stripping.)
 func stripOtariGatewayTools(body map[string]json.RawMessage) {
 	// A caller-defined function named web_search is also dropped (see
 	// reservedManagedToolName), so tool_choice naming it is dropped below.
@@ -1145,7 +1192,9 @@ func stripOtariGatewayTools(body map[string]json.RawMessage) {
 					continue
 				}
 				var fn map[string]json.RawMessage
-				if json.Unmarshal(fnRaw, &fn) != nil {
+				if json.Unmarshal(fnRaw, &fn) != nil || fn == nil {
+					// JSON null unmarshals into a nil map without an error;
+					// "function" must be a JSON object (issue #11).
 					continue
 				}
 				if reservedManagedToolName(fn) {
@@ -1288,19 +1337,19 @@ func RewriteRequest(body map[string]json.RawMessage, m Model, searchMaxUses int)
 		body[key] = raw
 	}
 	body["model"], _ = json.Marshal("synthetic.new:" + m.Upstream)
-	body["model"], _ = json.Marshal("synthetic.new:" + m.Upstream)
 	if raw, ok := body["stream"]; ok {
 		_ = json.Unmarshal(raw, &stream)
 	}
+	// stream_options is rebuilt, never forwarded (issue #11): the only
+	// option CodeAF needs is include_usage, and an unchecked sub-key (or a
+	// written include_usage:false) must not reach Otari. A non-streaming or
+	// stream-less request carries no stream_options at all.
 	if stream {
-		options := map[string]json.RawMessage{}
-		if raw, ok := body["stream_options"]; ok {
-			if err := json.Unmarshal(raw, &options); err != nil {
-				return false, fmt.Errorf("stream_options: %w", err)
-			}
-		}
-		options["include_usage"] = json.RawMessage("true")
-		body["stream_options"], _ = json.Marshal(options)
+		body["stream_options"], _ = json.Marshal(struct {
+			IncludeUsage bool `json:"include_usage"`
+		}{IncludeUsage: true})
+	} else {
+		delete(body, "stream_options")
 	}
 	return stream, nil
 }
@@ -1322,7 +1371,9 @@ func reservedManagedToolName(fn map[string]json.RawMessage) bool {
 		return false
 	}
 	name, ok := exactString(nameRaw)
-	return ok && strings.EqualFold(name, "web_search")
+	// TrimSpace first: a caller function named " web_search" is the same
+	// reserved name to Otari (issue #11).
+	return ok && strings.EqualFold(strings.TrimSpace(name), "web_search")
 }
 
 // declareOtariWebSearch appends the proxy's own otari_web_search entry to the
@@ -1685,7 +1736,10 @@ func (p *proxy) record(m Model, usage *Usage, usageDropped, stream bool, start t
 	// crossed the line counts as overage in full, even if it started
 	// seconds earlier. One run is short; that error is small.
 	if p.overage {
-		p.overageApi += line.APICostUSD
+		// Issue #11: searches are billed too, and line.APICostUSD covers
+		// only the API-priced tokens, so add this call's search charge the
+		// way runSpent's line.CostUSD already carries it.
+		p.overageApi += line.APICostUSD + float64(searches)*p.searchPrice
 	}
 	p.runSpent += line.CostUSD
 	if p.weekSpent+p.runSpent >= p.weekCap {
@@ -1867,14 +1921,14 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 	if repaired > 0 {
 		log.Printf("repaired %d invalid tool-call argument(s) for %s", repaired, m.Upstream)
 	}
-	// Issue #2: the run's remaining search budget, read under the same mutex
-	// the completed-search count is written under. 0 (budget spent) declares
-	// no search tool at all; otherwise the per-call cap is the smaller of
+	// Issue #2: the run's remaining search budget. Issue #11: reserve this
+	// call's declaration before forwarding it, and release the reservation
+	// when the call ends, so concurrent calls cannot each declare the full
+	// remaining budget. 0 (budget spent) declares no search tool at all;
+	// otherwise the per-call cap is the smaller of
 	// limits.search_max_uses_per_call and what remains.
-	p.mu.Lock()
-	remaining := p.searchesPerRun - p.searches
-	p.mu.Unlock()
-	searchMaxUses := min(p.searchMaxUses, remaining)
+	searchMaxUses := p.reserveSearches()
+	defer p.releaseSearches(searchMaxUses)
 	stream, err := RewriteRequest(body, m, searchMaxUses)
 	if err != nil {
 		p.fail(w, out, http.StatusBadRequest, err.Error())

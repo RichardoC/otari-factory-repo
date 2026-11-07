@@ -17,7 +17,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // searchFixtureModel is otariFixtureModel with a search-configured fixture:
@@ -444,5 +447,198 @@ func TestLoadConfigSearchLimitsDefaultsAndValidator(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("%s: error %q does not name %s", name, err, want)
 		}
+	}
+}
+
+// TestProxyConcurrentSearchReservations (issue #11 Done-when 2): twenty
+// streamed calls are forwarded at once with searches_per_run 10 and
+// search_max_uses_per_call 3. The stub holds every response until all twenty
+// requests have arrived, so every declaration is in flight together: their
+// sum is the run cap and never more. Once the calls finish and release their
+// reservations, the next call declares the per-call cap again.
+func TestProxyConcurrentSearchReservations(t *testing.T) {
+	captureLogs(t)
+	const calls = 20
+	var mu sync.Mutex
+	var bodies []string
+	var arrived sync.WaitGroup
+	arrived.Add(calls)
+	var seen atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(body))
+		mu.Unlock()
+		if seen.Add(1) <= calls {
+			arrived.Done()
+			// Hold every response until all twenty requests have been
+			// forwarded, so all twenty reservations are in flight at the
+			// same moment.
+			arrived.Wait()
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"+
+			"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"+
+			"data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	p, server := newSearchProxy(t, upstream, searchFixtureConfig(t, 3, 0.01, 10))
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(calls)
+	for i := 0; i < calls; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
+				strings.NewReader(`{"model":"zai-org/glm-5.3-flash","stream":true,"messages":[]}`))
+			if err != nil {
+				t.Errorf("concurrent call: %v", err)
+				return
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	mu.Lock()
+	got := append([]string{}, bodies...)
+	mu.Unlock()
+	if len(got) != calls {
+		t.Fatalf("the upstream stub saw %d requests, want %d", len(got), calls)
+	}
+	declared := 0
+	for _, body := range got {
+		for _, tool := range upstreamTools(t, body) {
+			if tool.Type != "otari_web_search" {
+				continue
+			}
+			if tool.MaxUses > 3 {
+				t.Errorf("a call declared max_uses %d, want at most search_max_uses_per_call 3", tool.MaxUses)
+			}
+			declared += tool.MaxUses
+		}
+	}
+	if declared > 10 {
+		t.Errorf("the concurrent calls declared %d searches in total, want at most searches_per_run 10", declared)
+	}
+	if declared != 10 {
+		t.Errorf("the concurrent calls declared %d searches in total, want exactly the 10 of the run cap", declared)
+	}
+
+	// Every reservation is released once its call ends, so the next call sees
+	// the full remaining budget again and declares the per-call cap.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		p.mu.Lock()
+		reserved := p.reserved
+		p.mu.Unlock()
+		if reserved == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("p.reserved = %d after every call ended, want 0", reserved)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	postStreamCall(t, server, `{"model":"zai-org/glm-5.3-flash","stream":true,"messages":[]}`)
+	mu.Lock()
+	last := bodies[len(bodies)-1]
+	mu.Unlock()
+	if tools := upstreamTools(t, last); len(tools) != 1 || tools[0].MaxUses != 3 {
+		t.Errorf("the call after the release declared %+v, want otari_web_search max_uses 3", tools)
+	}
+}
+
+// TestProxyOverageIncludesSearchCost (issue #11 Done-when 3): once the weekly
+// credit is exhausted (overage_usd above 0), a call that completes two
+// searches adds those searches' charge to the overage total on top of its
+// API-priced tokens.
+func TestProxyOverageIncludesSearchCost(t *testing.T) {
+	captureLogs(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"hi"}}],`+
+			`"otari_tool_calls":[{"id":"otari_ws_1","type":"web_search","status":"completed","query":"q"},`+
+			`{"id":"otari_ws_2","type":"web_search","status":"completed","query":"q"}],`+
+			`"usage":{"prompt_tokens":100,"completion_tokens":60}}`)
+	}))
+	defer upstream.Close()
+	p, server := newSearchProxy(t, upstream, searchFixtureConfig(t, 3, 0.01, 50))
+	// The weekly credit is exhausted by the first call; overage_usd (the API
+	// overage cap) is above 0, so the next call is recorded as overage.
+	p.weekCap = 0
+	p.overageCap = 1
+	postChat(t, server, `{"model":"zai-org/glm-5.3-flash","messages":[]}`)
+	if !p.overage {
+		t.Fatal("the proxy did not mark itself overage after the weekly credit was exhausted")
+	}
+	before := p.overageApi
+
+	postChat(t, server, `{"model":"zai-org/glm-5.3-flash","messages":[]}`)
+
+	usage := Usage{PromptTokens: 100, CompletionTokens: 60}
+	want := ApiCostOf(otariFixtureModel(), usage) + 2*0.01
+	if diff := (p.overageApi - before) - want; diff > 1e-12 || diff < -1e-12 {
+		t.Errorf("overageApi rose by %v, want %v (API-priced tokens + two $0.01 searches)", p.overageApi-before, want)
+	}
+}
+
+// TestLoadConfigSearchPriceZeroIsFree (issue #11 Done-when 4): a written
+// search_price_usd of 0 is a real price meaning free -- it loads as 0 and a
+// search adds nothing to the recorded cost -- while an absent field still
+// defaults to 0.01 (TestLoadConfigSearchLimitsDefaultsAndValidator) and a
+// negative value is refused naming the field.
+func TestLoadConfigSearchPriceZeroIsFree(t *testing.T) {
+	captureLogs(t)
+	model, err := json.Marshal(otariFixtureModel())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "models.json")
+	body := `{"limits":{"plan":"big","weekly_credit_usd":20,"run_credit_usd":5,` +
+		`"searches_per_run":50,"search_max_uses_per_call":3,"search_price_usd":0},` +
+		`"models":[` + string(model) + `]}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Limits.SearchPriceUSD != 0 {
+		t.Fatalf("search_price_usd: 0 loaded as %v, want 0 (free)", cfg.Limits.SearchPriceUSD)
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"hi"}}],`+
+			`"otari_tool_calls":[{"id":"otari_ws_1","type":"web_search","status":"completed","query":"q"},`+
+			`{"id":"otari_ws_2","type":"web_search","status":"completed","query":"q"}],`+
+			`"usage":{"prompt_tokens":100,"completion_tokens":60}}`)
+	}))
+	defer upstream.Close()
+	p, server := newSearchProxy(t, upstream, cfg)
+	postChat(t, server, `{"model":"zai-org/glm-5.3-flash","messages":[]}`)
+
+	lines, err := readLedger(p.ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls []*LedgerLine
+	for i := range lines {
+		if lines[i].Kind == "" && lines[i].Model == "zai-org/glm-5.3-flash" {
+			calls = append(calls, &lines[i])
+		}
+	}
+	if len(calls) != 1 {
+		t.Fatalf("ledger has %d call rows, want 1:\n%v", len(calls), lines)
+	}
+	want := CostOf(otariFixtureModel(), Usage{PromptTokens: 100, CompletionTokens: 60})
+	if diff := calls[0].CostUSD - want; diff > 1e-12 || diff < -1e-12 {
+		t.Errorf("ledger cost_usd = %v, want %v (free searches add nothing)", calls[0].CostUSD, want)
 	}
 }

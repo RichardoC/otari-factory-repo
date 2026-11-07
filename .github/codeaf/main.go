@@ -1120,6 +1120,8 @@ func hasFoldingDuplicate(m map[string]json.RawMessage, key string) bool {
 // kept function tool, re-emitted canonically. (Issue #2 will add the
 // proxy's own controlled otari_web_search entry after this stripping.)
 func stripOtariGatewayTools(body map[string]json.RawMessage) {
+	// A caller-defined function named web_search is also dropped (see
+	// reservedManagedToolName), so tool_choice naming it is dropped below.
 	var keptNames map[string]bool
 	if raw, ok := body["tools"]; ok {
 		var tools []json.RawMessage
@@ -1144,6 +1146,9 @@ func stripOtariGatewayTools(body map[string]json.RawMessage) {
 				}
 				var fn map[string]json.RawMessage
 				if json.Unmarshal(fnRaw, &fn) != nil {
+					continue
+				}
+				if reservedManagedToolName(fn) {
 					continue
 				}
 				canonical, err := json.Marshal(struct {
@@ -1307,6 +1312,26 @@ func RewriteRequest(body map[string]json.RawMessage, m Model, searchMaxUses int)
 		body["stream_options"], _ = json.Marshal(options)
 	}
 	return stream, nil
+}
+
+// reservedManagedToolName reports whether a caller-defined function uses a
+// name Otari reserves for its managed web tools. Otari answers 400 "A
+// caller-defined function uses a reserved managed web-tool name" to any
+// request that declares otari_web_search next to a function named
+// web_search, and CodeAF defines one of its own, so every call failed once
+// the proxy began declaring otari_web_search (issue #2). Probed against
+// eu.api.otari.ai on 2026-11-07: web_search is refused; web_fetch, fetch,
+// search, websearch, fetch_url and read_url are not. Dropping the caller's
+// web_search leaves the model Otari's managed search, which the proxy
+// declares, counts and caps. The match is case-insensitive so a case variant
+// cannot slip a reserved name past the check.
+func reservedManagedToolName(fn map[string]json.RawMessage) bool {
+	nameRaw, ok := fn["name"]
+	if !ok {
+		return false
+	}
+	name, ok := exactString(nameRaw)
+	return ok && strings.EqualFold(name, "web_search")
 }
 
 // declareOtariWebSearch appends the proxy's own otari_web_search entry to the

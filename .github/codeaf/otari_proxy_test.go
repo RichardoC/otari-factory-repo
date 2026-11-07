@@ -430,6 +430,52 @@ func TestRewriteRequestOtariSelector(t *testing.T) {
 	}
 }
 
+// TestRewriteRequestDropsReservedWebSearchFunction: Otari refuses a request
+// that declares otari_web_search next to a caller-defined function named
+// web_search (400 "reserved managed web-tool name"), and CodeAF defines one,
+// so every live call failed after issue #2. The caller's web_search (in any
+// case) and a tool_choice naming it are dropped; other function tools and the
+// proxy's own otari_web_search declaration are kept.
+func TestRewriteRequestDropsReservedWebSearchFunction(t *testing.T) {
+	m := otariFixtureModel()
+	body := map[string]json.RawMessage{
+		"model": json.RawMessage(`"` + m.ID + `"`),
+		"tools": json.RawMessage(`[
+			{"type":"function","function":{"name":"web_search","parameters":{"type":"object"}}},
+			{"type":"function","function":{"name":"Web_Search","parameters":{"type":"object"}}},
+			{"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}
+		]`),
+		"tool_choice": json.RawMessage(`{"type":"function","function":{"name":"web_search"}}`),
+	}
+	if _, err := RewriteRequest(body, m, 3); err != nil {
+		t.Fatal(err)
+	}
+	var tools []struct {
+		Type     string `json:"type"`
+		MaxUses  int    `json:"max_uses"`
+		Function struct {
+			Name string `json:"name"`
+		} `json:"function"`
+	}
+	if err := json.Unmarshal(body["tools"], &tools); err != nil {
+		t.Fatalf("tools %s: %v", body["tools"], err)
+	}
+	var names []string
+	for _, tool := range tools {
+		if tool.Type == "function" {
+			names = append(names, tool.Function.Name)
+		} else {
+			names = append(names, tool.Type)
+		}
+	}
+	if got, want := strings.Join(names, ","), "read_file,otari_web_search"; got != want {
+		t.Errorf("forwarded tools = %s, want %s (body %s)", got, want, body["tools"])
+	}
+	if _, ok := body["tool_choice"]; ok {
+		t.Errorf("tool_choice naming the dropped web_search was forwarded: %s", body["tool_choice"])
+	}
+}
+
 // TestOtariGatewayControlsStripped: Otari's chat API acts on gateway-only
 // request fields (mcp_servers, mcp_server_ids, guardrails, tools_header,
 // max_tool_iterations, session_label) and on tool entries it runs

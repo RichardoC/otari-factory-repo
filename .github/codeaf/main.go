@@ -578,9 +578,10 @@ type Usage struct {
 	CompletionTokensDetails json.RawMessage `json:"completion_tokens_details,omitempty"`
 	Cost                    float64         `json:"cost"`
 	// OtariCostRaw is the cost_usd the Otari chat upstream reports, before
-	// validation. It is never relayed to the client as a struct field: the
-	// relays pass upstream's raw bytes through, so the client sees what
-	// upstream sent.
+	// validation. The relays do not pass upstream's bytes through untouched:
+	// they decode the usage block into this struct and re-marshal it, and
+	// this field carries the raw cost_usd bytes through that re-marshal, so
+	// the client still sees what upstream sent.
 	OtariCostRaw json.RawMessage `json:"cost_usd,omitempty"`
 	// OtariCostUSD is the validated cost_usd (maxOtariCostUSD bounds it).
 	OtariCostUSD float64 `json:"-"`
@@ -1021,13 +1022,57 @@ func EffortFor(m Model, reasoning reasoningRequest) string {
 // openRouterOnly are request fields synthetic.new does not understand.
 var openRouterOnly = []string{"provider", "transforms", "route", "models", "usage", "plugins", "include_reasoning", "reasoning"}
 
+// otariGatewayOnly are request fields Otari's gateway acts on itself
+// (https://docs.otari.ai/otari/for-integrators/api-reference/chat.md):
+// MCP servers, guardrails and session/tool-iteration controls. An agent
+// request is untrusted input, so the proxy strips them all from every
+// forwarded body rather than letting the agent attach MCP server URLs and
+// tokens, guardrail endpoints or session labels to a factory call.
+var otariGatewayOnly = []string{"mcp_servers", "mcp_server_ids", "guardrails", "tools_header", "max_tool_iterations", "session_label"}
+
+// stripOtariGatewayTools rewrites the request's tools array to the entries
+// whose type is "function". Everything else -- type "mcp", the otari_*
+// tools (otari_web_search, otari_web_fetch, otari_code_execution) and the
+// native aliases (code_execution, code_interpreter, code_execution_<date>,
+// web_search, web_search_<date>, web_search_preview, web_fetch_<date>) --
+// is a tool Otari runs server-side and bills outside the factory's caps,
+// so an agent must not be able to call for one. A tools value that is not
+// an array of objects is dropped whole. (Issue #2 will add the proxy's own
+// controlled otari_web_search entry after this stripping.)
+func stripOtariGatewayTools(body map[string]json.RawMessage) {
+	raw, ok := body["tools"]
+	if !ok {
+		return
+	}
+	var tools []json.RawMessage
+	if json.Unmarshal(raw, &tools) != nil {
+		delete(body, "tools")
+		return
+	}
+	functions := make([]json.RawMessage, 0, len(tools))
+	for _, tool := range tools {
+		var t struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(tool, &t) == nil && t.Type == "function" {
+			functions = append(functions, tool)
+		}
+	}
+	if len(functions) == 0 {
+		delete(body, "tools")
+		return
+	}
+	body["tools"], _ = json.Marshal(functions)
+}
+
 // RewriteRequest rewrites a chat request for hosted Otari, which fronts the
 // same synthetic.new models. Otari selects a provider model with a
 // provider:model selector, and the provider is named "synthetic.new", so the
 // model sent upstream is "synthetic.new:" + the synthetic.new model id
 // (models.json's upstream field) -- e.g. synthetic.new:hf:zai-org/GLM-5.3-Flash
-// -- which pins the call to the synthetic.new provider key. Fields Otari does
-// not know about pass through untouched.
+// -- which pins the call to the synthetic.new provider key. Otari's own
+// gateway-only fields and tools are stripped from the body (otariGatewayOnly,
+// stripOtariGatewayTools): the agent gets plain function tool calls only.
 func RewriteRequest(body map[string]json.RawMessage, m Model) (stream bool, err error) {
 	if raw, ok := body["reasoning"]; ok {
 		var reasoning reasoningRequest
@@ -1040,6 +1085,10 @@ func RewriteRequest(body map[string]json.RawMessage, m Model) (stream bool, err 
 	for _, key := range openRouterOnly {
 		delete(body, key)
 	}
+	for _, key := range otariGatewayOnly {
+		delete(body, key)
+	}
+	stripOtariGatewayTools(body)
 	body["model"], _ = json.Marshal("synthetic.new:" + m.Upstream)
 	if raw, ok := body["stream"]; ok {
 		_ = json.Unmarshal(raw, &stream)

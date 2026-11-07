@@ -150,7 +150,8 @@ whether through prompt injection or a compromised model.
   proxy's keys (Otari for chat, the synthetic.new key for search) still
   reach the proxy alone, on stdin.
 - The job that runs CodeAF (`run`) gets no write token and no secret other
-  than the proxy's key on stdin. Anything that needs write access (commit,
+  than the proxy's two keys on stdin (the Otari chat key and the
+  synthetic.new search key). Anything that needs write access (commit,
   push, PR, comments, CI dispatch) happens in `publish`, on a fresh runner.
 - After CodeAF has run, nothing on that runner can be trusted: binaries,
   `.git` (hooks, config), `$GITHUB_ENV`, `$GITHUB_OUTPUT`, files. Never give a

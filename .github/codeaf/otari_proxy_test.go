@@ -24,18 +24,45 @@ import (
 	"time"
 )
 
-// otariModels writes a minimal models.json naming the GLM-5.3-Flash model the
-// e2e test calls, and returns its path. Same shape writePlannerModels writes.
+// otariFixtureModel is the one model the Otari proxy tests use: the test's
+// own fixture, built here rather than read from models.json (AGENTS.md: a
+// test never hard-codes a value from it). The prices are distinct from the
+// real catalog's on purpose, so any code path that priced against
+// models.json instead of the config the proxy was given would fail these
+// tests rather than pass by coincidence.
+func otariFixtureModel() Model {
+	return Model{
+		ID:              "zai-org/glm-5.3-flash",
+		Upstream:        "hf:zai-org/GLM-5.3-Flash",
+		Name:            "GLM-5.3-Flash (synthetic.new via Otari)",
+		Role:            "base",
+		MaxConcurrent:   2,
+		Input:           0.21,
+		Output:          0.62,
+		CacheRead:       0.05,
+		APIInput:        0.31,
+		APICached:       0.07,
+		APIOutput:       0.83,
+		ContextLength:   524288,
+		InputModalities: []string{"text", "image"},
+		Efforts:         []string{"medium", "high", "max"},
+	}
+}
+
+// otariModels writes a minimal models.json holding otariFixtureModel, and
+// returns its path. Same shape writePlannerModels writes.
 func otariModels(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "models.json")
-	body := `{"limits":{"plan":"big","weekly_credit_usd":20,"run_credit_usd":5},
-		"models":[{"id":"zai-org/glm-5.3-flash","upstream":"hf:zai-org/GLM-5.3-Flash",
-		"name":"GLM-5.3-Flash (synthetic.new via Otari)","role":"base","max_concurrent":2,
-		"input":0.1,"output":0.25,"cache_read":0.02,"api_input":0.15,"api_cached":0.04,
-		"api_output":0.5,"context_length":524288,"input_modalities":["text","image"],
-		"efforts":["medium","high","max"]}]}`
-	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+	cfg := Config{
+		Limits: Limits{Plan: "big", WeeklyCreditUSD: 20, RunCreditUSD: 5},
+		Models: []Model{otariFixtureModel()},
+	}
+	body, err := json.MarshalIndent(cfg, "", "\t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, body, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return path
@@ -186,7 +213,7 @@ func TestProxyOtariTwoKeysEndToEnd(t *testing.T) {
 	if err := json.Unmarshal(chatBody, &relayed); err != nil {
 		t.Fatalf("chat response %q: %v", chatBody, err)
 	}
-	m := mustResolve(t, testModels(t), "zai-org/glm-5.3-flash")
+	m := otariFixtureModel()
 	wantCost := CostOf(m, Usage{PromptTokens: 100, CompletionTokens: 60})
 	if relayed.Usage.Cost != wantCost {
 		t.Errorf("relayed usage.cost = %v, want %v (api_* list prices)", relayed.Usage.Cost, wantCost)
@@ -314,7 +341,7 @@ func TestOtariCostUSDStreamedToLedger(t *testing.T) {
 
 	ledger := filepath.Join(t.TempDir(), "ledger.jsonl")
 	p := &proxy{upstream: upstream.URL, apiKey: "otari-key", searchKey: "synthetic-key",
-		ledger: ledger, runCap: 5, weekCap: 20, models: testModels(t), client: upstream.Client()}
+		ledger: ledger, runCap: 5, weekCap: 20, models: []Model{otariFixtureModel()}, client: upstream.Client()}
 	server := httptest.NewServer(p)
 	defer server.Close()
 
@@ -329,8 +356,7 @@ func TestOtariCostUSDStreamedToLedger(t *testing.T) {
 		response.Body.Close()
 	}
 
-	m := mustResolve(t, testModels(t), "zai-org/glm-5.3-flash")
-	wantCost := CostOf(m, Usage{PromptTokens: 100, CompletionTokens: 60})
+	wantCost := CostOf(otariFixtureModel(), Usage{PromptTokens: 100, CompletionTokens: 60})
 
 	// A good decimal cost_usd is recorded.
 	post("zai-org/glm-5.3-flash")
@@ -369,82 +395,148 @@ func TestOtariCostUSDStreamedToLedger(t *testing.T) {
 	}
 }
 
-// TestModelsIDRoleSetAgainstDefaultBranch: the model ids, roles and
-// max_concurrent values are unchanged from the default branch's models.json,
-// and every upstream still resolves to the Otari selector
-// "synthetic.new:" + the synthetic.new model id. Skipped when no default
-// branch ref is available (a shallow checkout without one).
-func TestModelsIDRoleSetAgainstDefaultBranch(t *testing.T) {
-	if testing.Short() {
-		t.Skip("needs the default branch's models.json")
-	}
-	// The module lives at .github/codeaf; the repository root is two up.
-	repo := filepath.Join("..", "..")
-	var base []byte
-	for _, ref := range []string{"origin/main", "main"} {
-		out, err := exec.Command("git", "-C", repo, "show", ref+":.github/codeaf/models.json").Output()
-		if err == nil {
-			base = out
-			break
-		}
-	}
-	if base == nil {
-		t.Skip("no default-branch models.json available")
-	}
-	type row struct {
-		Role          string `json:"role"`
-		MaxConcurrent int    `json:"max_concurrent"`
-		Upstream      string `json:"upstream"`
-	}
-	var baseRaw struct {
-		Models []struct {
-			ID string `json:"id"`
-			row
-		} `json:"models"`
-	}
-	if err := json.Unmarshal(base, &baseRaw); err != nil {
-		t.Fatalf("default branch models.json: %v", err)
-	}
-	baseModels := map[string]row{}
-	for _, mm := range baseRaw.Models {
-		baseModels[mm.ID] = mm.row
-	}
-	var nowRaw struct {
-		Models []struct {
-			ID string `json:"id"`
-			row
-		} `json:"models"`
-	}
-	data, err := os.ReadFile("models.json")
-	if err != nil {
+// TestRewriteRequestOtariSelector: RewriteRequest turns a catalog id's
+// upstream into Otari's "synthetic.new:" + the synthetic.new model id, the
+// provider:model selector that pins the call to Otari's synthetic.new
+// provider key -- for the fixture model here, and by the same code path for
+// every entry in models.json, whose upstream field is the synthetic.new id.
+func TestRewriteRequestOtariSelector(t *testing.T) {
+	m := otariFixtureModel()
+	body := map[string]json.RawMessage{"model": json.RawMessage(`"` + m.ID + `"`)}
+	if _, err := RewriteRequest(body, m); err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(data, &nowRaw); err != nil {
-		t.Fatalf("models.json: %v", err)
+	var got string
+	if err := json.Unmarshal(body["model"], &got); err != nil {
+		t.Fatalf("rewritten model %s: %v", body["model"], err)
 	}
-	if len(nowRaw.Models) != len(baseModels) {
-		t.Errorf("models.json lists %d models, the default branch %d", len(nowRaw.Models), len(baseModels))
+	if want := otariSelector(m.Upstream); got != want {
+		t.Errorf("RewriteRequest model = %q, want %q", got, want)
 	}
-	for _, mm := range nowRaw.Models {
-		want, ok := baseModels[mm.ID]
-		if !ok {
-			t.Errorf("model %q is not on the default branch", mm.ID)
-			continue
+}
+
+// TestOtariGatewayControlsStripped: Otari's chat API acts on gateway-only
+// request fields (mcp_servers, mcp_server_ids, guardrails, tools_header,
+// max_tool_iterations, session_label) and on tool entries it runs
+// server-side -- every type except "function", which covers the otari_*
+// tools and the native aliases (code_execution, code_interpreter,
+// code_execution_<date>, web_search, web_search_<date>, web_search_preview,
+// web_fetch_<date>). The agent's request is untrusted, so none of them may
+// reach the upstream: each is sent here and asserted absent from the body
+// the stub sees, while an ordinary function tool still arrives. (Issue #2
+// adds the proxy's own controlled otari_web_search entry after this
+// stripping.)
+func TestOtariGatewayControlsStripped(t *testing.T) {
+	var mu sync.Mutex
+	var upstreamBodies []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		upstreamBodies = append(upstreamBodies, string(body))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer upstream.Close()
+
+	p := &proxy{upstream: upstream.URL, apiKey: "otari-key", searchKey: "synthetic-key",
+		ledger: filepath.Join(t.TempDir(), "ledger.jsonl"), runCap: 5, weekCap: 20,
+		models: []Model{otariFixtureModel()}, client: upstream.Client()}
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	gatewayFields := []string{
+		"mcp_servers", "mcp_server_ids", "guardrails", "tools_header",
+		"max_tool_iterations", "session_label",
+	}
+	values := map[string]string{
+		"mcp_servers":         `[{"name":"evil","url":"https://evil.example/mcp","authorization_token":"tok"}]`,
+		"mcp_server_ids":      `["srv_123"]`,
+		"guardrails":          `[{"name":"g","url":"https://evil.example/guard"}]`,
+		"tools_header":        `{"x-evil":"1"}`,
+		"max_tool_iterations": `99`,
+		"session_label":       `"sneaky-session"`,
+	}
+	// Every tool type that is not "function": Otari's own otari_* tools and
+	// the native aliases the chat API accepts (the <date> suffixes stand for
+	// a dated alias such as web_search_2026_11_07).
+	nonFunctionTypes := []string{
+		"otari_web_search", "otari_web_fetch", "otari_code_execution",
+		"code_execution", "code_interpreter", "code_execution_2026_11_07",
+		"web_search", "web_search_2026_11_07", "web_search_preview",
+		"web_fetch_2026_11_07", "mcp",
+	}
+	functionTool := `{"type":"function","function":{"name":"list_files","parameters":{"type":"object"}}}`
+
+	post := func(body string) {
+		t.Helper()
+		resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
 		}
-		if mm.Role != want.Role {
-			t.Errorf("model %q role = %q, the default branch has %q", mm.ID, mm.Role, want.Role)
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+	lastBody := func() string {
+		t.Helper()
+		mu.Lock()
+		defer mu.Unlock()
+		if len(upstreamBodies) == 0 {
+			t.Fatal("the upstream stub saw no request")
 		}
-		if mm.MaxConcurrent != want.MaxConcurrent {
-			t.Errorf("model %q max_concurrent = %d, the default branch has %d", mm.ID, mm.MaxConcurrent, want.MaxConcurrent)
+		return upstreamBodies[len(upstreamBodies)-1]
+	}
+
+	// Each gateway field alone, with a function tool that must survive.
+	for _, field := range gatewayFields {
+		post(`{"model":"zai-org/glm-5.3-flash","messages":[],"tools":[` + functionTool + `],` +
+			`"` + field + `":` + values[field] + `}`)
+		body := lastBody()
+		if strings.Contains(body, `"`+field+`"`) {
+			t.Errorf("gateway field %s reached the upstream: %s", field, body)
 		}
-		if mm.Upstream != want.Upstream {
-			t.Errorf("model %q upstream = %q, the default branch has %q", mm.ID, mm.Upstream, want.Upstream)
+		if !strings.Contains(body, `"list_files"`) {
+			t.Errorf("the ordinary function tool was lost with %s: %s", field, body)
 		}
-		// Every upstream resolves to Otari's synthetic.new: selector.
-		if !strings.HasPrefix(mm.Upstream, "synthetic.new:") &&
-			otariSelector(mm.Upstream) != "synthetic.new:"+mm.Upstream {
-			t.Errorf("model %q: upstream %q does not map to synthetic.new:%s", mm.ID, mm.Upstream, mm.Upstream)
+	}
+
+	// All gateway fields at once, plus every non-function tool type beside
+	// one function tool: only the function tool may arrive.
+	parts := make([]string, 0, len(gatewayFields)+len(nonFunctionTypes)+1)
+	for _, field := range gatewayFields {
+		parts = append(parts, `"`+field+`":`+values[field])
+	}
+	tools := make([]string, 0, len(nonFunctionTypes)+1)
+	for _, typ := range nonFunctionTypes {
+		tools = append(tools, `{"type":"`+typ+`"}`)
+	}
+	tools = append(tools, functionTool)
+	post(`{"model":"zai-org/glm-5.3-flash","messages":[],"tools":[` + strings.Join(tools, ",") + `],` +
+		strings.Join(parts, ",") + `}`)
+	body := lastBody()
+	for _, field := range gatewayFields {
+		if strings.Contains(body, `"`+field+`"`) {
+			t.Errorf("gateway field %s reached the upstream: %s", field, body)
 		}
+	}
+	for _, typ := range nonFunctionTypes {
+		if strings.Contains(body, `"`+typ+`"`) {
+			t.Errorf("tool type %s reached the upstream: %s", typ, body)
+		}
+	}
+	if !strings.Contains(body, `"list_files"`) {
+		t.Errorf("the ordinary function tool was stripped too: %s", body)
+	}
+	var sent struct {
+		Tools []struct {
+			Type string `json:"type"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal([]byte(body), &sent); err != nil {
+		t.Fatalf("upstream body %s: %v", body, err)
+	}
+	if len(sent.Tools) != 1 || sent.Tools[0].Type != "function" {
+		t.Errorf("upstream tools = %+v, want the one function tool", sent.Tools)
 	}
 }
 

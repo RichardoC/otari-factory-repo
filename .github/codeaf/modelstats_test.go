@@ -800,9 +800,10 @@ func TestModelStatsCutCountedOnce(t *testing.T) {
 }
 
 // TestModelStatsProxyMarkerLinesAreNotRows: the proxy's own ledger markers
-// -- kind "proxy_start" (recordMarker, main.go), kind "quotas" (recordQuotas,
-// main.go:1483) and kind "search" (search.go:158, whose model is the fixed id
-// "web-search") -- are not rows about a model. Found by review (finding 5):
+// -- kind "proxy_start" (recordMarker, main.go), kind "search" (search.go:158,
+// whose model is the fixed id "web-search") and kind "quotas" (no longer
+// written now the quota guard is gone, but old ledgers still carry it) --
+// are not rows about a model. Found by review (finding 5):
 // they were decoded as model "" (or "web-search"), which is not in
 // models.json, so every one of them was a rejection and a normal run tripped
 // the >1% reject alert on the proxy's own bookkeeping.
@@ -816,7 +817,8 @@ func TestModelStatsProxyMarkerLinesAreNotRows(t *testing.T) {
 		`{"ts":"2026-10-21T11:00:00Z","model":"alpha","completion_tokens":1000,"usage_seen":true,"ttft_ms":1000,"dur_ms":9000}`,
 		// proxy_start: no model field at all.
 		`{"kind":"proxy_start"}`,
-		// quotas: an opaque body, no model field.
+		// quotas: an opaque body, no model field. Not written any more, but
+		// a ledger from before the quota guard was dropped still has one.
 		`{"kind":"quotas","quotas":"{\"plan\":\"big\"}"}`,
 		// search: the model the proxy writes is the fixed id web-search, not
 		// a model in models.json.

@@ -373,12 +373,17 @@ func ProposalLabels(p Proposal) []string {
 // issue is queued.
 const proposalE2EPlaceholder = "(fill in before queueing: the one command or run that proves the seams work)"
 
+// approvalNote is the exact sentence ProposalBody appends when a gated path is
+// named and the planner did not itself state the approval requirement.
+const approvalNote = "Note: changes under .github/ outside .github/codeaf/ (workflows, CODEOWNERS) need a maintainer's approval before merging."
+
 // ProposalBody renders one proposal as the body of the issue the publish job
 // opens: a fixed markdown template, every untrusted text passed through
 // escapeMD (the title on one line), the dependencies rendered as plain
 // numbers. When the Problem or What names a path under .github/ outside
-// .github/codeaf/ and the proposal does not already say the word "approval",
-// the note that such changes need a maintainer's approval is appended — the
+// .github/codeaf/ and the proposal does not itself state the approval
+// requirement, the note that such changes need a maintainer's approval is
+// appended — the
 // planner was told to state it, and the factory does not rely on it having
 // listened. The path rule is underGithub (patchsplit.go), the same one the
 // patch gate and the publish job's package step apply, so .github/CODEOWNERS
@@ -413,10 +418,30 @@ func ProposalBody(p Proposal) string {
 		fmt.Fprintf(&b, "\n**Depends on**: %s\n", strings.Join(nums, ", "))
 	}
 	text := strings.ToLower(p.Problem + "\n" + p.What)
-	if namesApprovalPath(text) && !strings.Contains(text, "approval") {
-		b.WriteString("\nNote: changes under .github/ outside .github/codeaf/ (workflows, CODEOWNERS) need a maintainer's approval before merging.\n")
+	if namesApprovalPath(text) && !statesApprovalRequirement(text) {
+		b.WriteString("\n" + approvalNote + "\n")
 	}
 	return b.String()
+}
+
+// statesApprovalRequirement reports whether text states the maintainer-approval
+// requirement itself, rather than merely using the word "approval" (issue #4):
+// a bare substring let an unrelated phrase like "the approval job" defeat the
+// note. text is already lower-cased. The phrases are the ways the planner is
+// told to phrase the requirement. A proposal that merely names the
+// codeaf-harness environment does not state it (issue #4, owner decision):
+// it must still carry the note.
+func statesApprovalRequirement(text string) bool {
+	for _, phrase := range []string{
+		"maintainer's approval",
+		"maintainer’s approval", // curly apostrophe variant
+		"approval before merging",
+	} {
+		if strings.Contains(text, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 // namesApprovalPath reports whether text names a path that underGithub guards:

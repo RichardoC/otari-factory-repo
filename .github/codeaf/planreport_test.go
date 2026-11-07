@@ -390,15 +390,28 @@ func TestProposalBodyWorkflowsNote(t *testing.T) {
 	if body := ProposalBody(p); strings.Contains(body, approvalNote) {
 		t.Errorf("the note duplicated the planner's approval statement:\n%s", body)
 	}
+	// An unrelated use of "approval" (issue #4) does not state the
+	// requirement: the note is still added.
+	p = Proposal{Title: "t", Problem: ".github/workflows/ci.yml runs the approval job twice per PR", What: "run it once"}
+	if body := ProposalBody(p); !strings.Contains(body, approvalNote) {
+		t.Errorf("an unrelated %q defeated the note:\n%s", "approval", body)
+	}
+	// A real statement of the requirement still suppresses it.
+	p = Proposal{Title: "t", Problem: ".github/workflows/ci.yml runs the approval job twice per PR", What: "run it once; the change needs a maintainer's approval before merging"}
+	if body := ProposalBody(p); strings.Contains(body, approvalNote) {
+		t.Errorf("the note duplicated the planner's statement of the requirement:\n%s", body)
+	}
+	// Merely naming the codeaf-harness environment does not state the
+	// requirement (issue #4): the note is still added.
+	p = Proposal{Title: "t", Problem: "change codeaf-harness reviewers in .github/workflows/codeaf.yml", What: "edit the reviewers list"}
+	if body := ProposalBody(p); !strings.Contains(body, approvalNote) {
+		t.Errorf("a codeaf-harness mention wrongly suppressed the note:\n%s", body)
+	}
 	// A plain proposal that names no gated path carries none.
 	if body := ProposalBody(Proposal{Title: "t", Problem: "app/widgets/queue.go", What: "add a retry"}); strings.Contains(body, approvalNote) {
 		t.Errorf("the note appears without a gated path mention:\n%s", body)
 	}
 }
-
-// approvalNote is the exact sentence ProposalBody appends when a gated path is
-// named and the planner did not already state the approval requirement.
-const approvalNote = "Note: changes under .github/ outside .github/codeaf/ (workflows, CODEOWNERS) need a maintainer's approval before merging."
 
 func TestProposalBodyEscapesAndTemplate(t *testing.T) {
 	p := Proposal{

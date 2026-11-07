@@ -180,10 +180,12 @@ whether through prompt injection or a compromised model.
   `publish` still checks the approval itself, and the run brief tells the
   agent never to merge or copy base-branch changes by hand, because publish
   refuses an unverifiable replay. publish recomputes whether the merge
-  carries workflow changes and never trusts the `workflows` field -- the
-  field only routes the job, like `touches_harness`; a run that records
-  `workflows: false` for a merge that does carry them is refused even with
-  an approval. The run-side merge commit is data
+  carries workflow changes, relative to the PR head (the branch's own
+  workflow edits are kept; only paths the merge changes must equal what the
+  merged-in base commit already has), and never trusts the `workflows`
+  field -- the field only routes the job, like `touches_harness`; a run that
+  records `workflows: false` for a merge that does carry them is refused
+  even with an approval. The run-side merge commit is data
   verified by recomputation, never fetched or trusted; with no
   `merge-info.json` present, publish falls back to merging
   the base tip first and applying the patch on top of it. It applies it with

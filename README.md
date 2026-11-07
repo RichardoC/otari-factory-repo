@@ -452,8 +452,9 @@ the workflow routes `publish` into the `codeaf-harness` environment, so a
 maintainer must approve. With approval, `publish` recreates the merge (still
 from the same two parents, still verified by tree hash) and pushes it with
 the GitHub App token, which can carry workflow changes where `GITHUB_TOKEN`
-cannot; it refuses unless the merge's `.github/workflows/` files equal the
-recorded base tip's byte-for-byte, so the merge brings in only what the base
+cannot; it refuses unless every workflow path the merge changes relative to
+the PR head equals the recorded base tip's content byte-for-byte -- additions,
+edits and deletions alike -- so the merge brings in only what the base
 already has. Without approval, `publish` refuses with an error naming the
 maintainer approval rather than silently pushing the patch alone. When there
 is no `merge-info.json` (the behind and diverged fallbacks), the patch is
@@ -469,11 +470,14 @@ like `touches_harness`, only routes the job. The byte check compares the
 merge with the base tip the run actually merged in, not the base branch's
 current tip.
 
-A consequence: a PR branch with its own edits under `.github/workflows/`
-cannot catch up with its base through this path, because its workflow files
-will never equal the base's -- a merge would keep the branch's edits
-where the approval check and the workflow policy cannot see them. Such a PR
-needs a person to merge the base by hand.
+"Carries" is measured relative to the PR head: the branch's own workflow
+edits are kept, because a merge that leaves a workflow path as the head has
+it publishes nothing new, so that path is neither checked nor gated on the
+approval. Only workflow paths the merge actually changes must equal the
+base's content, and bringing those in needs the approval. A PR that edits
+the same workflow file its base changed may still conflict, or merge that
+file into content the base does not have; `publish` refuses such a merge,
+and the PR needs a person to sort it out.
 
 ### Keeping CodeAF current (issue #35)
 

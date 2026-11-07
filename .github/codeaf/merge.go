@@ -687,14 +687,16 @@ func publishMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile, stateFile
 		if err != nil {
 			return out, err
 		}
-		if err := gitRun(dir, "reset", "--hard", commit); err != nil {
+		// Issue #16: every workflow path the merge changes relative to the
+		// PR head must be byte-for-byte what the commit it merged in already
+		// has -- the same check recreateMerge runs, so an approved merge
+		// that would publish workflow content the base does not have is
+		// refused, while the head's own workflow edits are kept. Checked
+		// before the reset, so a refusal leaves the branch untouched.
+		if err := checkFallbackWorkflows(dir, head, commit, onto); err != nil {
 			return out, err
 		}
-		// Issue #16: what the merge carries under .github/workflows/ must be
-		// byte-for-byte what the commit it merged in already has -- the same
-		// check recreateMerge runs, so an approved merge that would publish
-		// a workflow file the base does not have is refused.
-		if err := checkFallbackWorkflows(dir, commit, onto); err != nil {
+		if err := gitRun(dir, "reset", "--hard", commit); err != nil {
 			return out, err
 		}
 		out = mergeOutcome{State: mergeKindClean, Commit: commit, Tree: tree}
@@ -746,11 +748,12 @@ func publishMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile, stateFile
 	if err != nil {
 		return out, err
 	}
-	if err := gitRun(dir, "reset", "--hard", commit); err != nil {
+	// Issue #16: the same per-path byte check as on the behind branch above,
+	// before the reset so a refusal leaves the branch untouched.
+	if err := checkFallbackWorkflows(dir, head, commit, onto); err != nil {
 		return out, err
 	}
-	// Issue #16: the same byte check as on the behind branch above.
-	if err := checkFallbackWorkflows(dir, commit, onto); err != nil {
+	if err := gitRun(dir, "reset", "--hard", commit); err != nil {
 		return out, err
 	}
 	out.State = mergeKindClean
@@ -791,19 +794,69 @@ func recomputeWorkflowsCarried(dir, from, to string) (bool, error) {
 
 // checkFallbackWorkflows verifies, for a merge publish landed itself (the
 // behind and diverged fallbacks, which have no run-side merge to recreate),
-// that the merge's .github/workflows/ is byte-for-byte what the commit it
-// merged in already has (issue #16) -- the same check recreateMerge runs. A
-// merge carrying any other workflow content is refused, whatever the
-// approval said.
-func checkFallbackWorkflows(dir, commit, onto string) error {
-	wf, err := workflowChanges(dir, commit, onto)
+// that every workflow path the merge changes relative to the PR head is
+// byte-for-byte what the commit it merged in already has (issue #16) -- the
+// same per-path check recreateMerge runs. The head's own workflow edits are
+// kept: paths the merge leaves as they are on head publish nothing new, so
+// they are not checked, and the check passes without looking at onto when
+// the merge changes no workflow path relative to head. A merge carrying any
+// other workflow content is refused, whatever the approval said.
+func checkFallbackWorkflows(dir, head, commit, onto string) error {
+	return checkMergeWorkflows(dir, head, commit, onto)
+}
+
+// checkMergeWorkflows is the workflow byte check shared by recreateMerge and
+// the fallbacks: for each path under .github/workflows/ that the merge
+// commit changes relative to the PR head, the merge's content must equal the
+// commit merged in's (onto) -- additions, edits and deletions alike -- so a
+// merge brings in only what the base already has, never workflow content of
+// its own. Paths the merge leaves as they are on head are the branch's own
+// edits, already on the branch, so they are not checked.
+func checkMergeWorkflows(dir, head, commit, onto string) error {
+	changed, err := workflowChanges(dir, head, commit)
 	if err != nil {
-		return fmt.Errorf("could not check the merge's workflow files against the commit it merged in (%s): %w", shortSHA(onto), err)
+		return fmt.Errorf("could not list the workflow paths the merge changes relative to the PR head: %w", err)
 	}
-	if len(wf) > 0 {
-		return fmt.Errorf("the merge's workflow files differ from the commit it merged in (%s) (%s); a base merge brings in only what the base branch already has, so refusing the merge", shortSHA(onto), strings.Join(wf, ", "))
+	for _, path := range changed {
+		inMerge, err := blobHash(dir, commit, path)
+		if err != nil {
+			return fmt.Errorf("could not read %s in the merge commit %s: %w", path, shortSHA(commit), err)
+		}
+		inOnto, err := blobHash(dir, onto, path)
+		if err != nil {
+			return fmt.Errorf("could not read %s in the commit merged in (%s): %w", path, shortSHA(onto), err)
+		}
+		if inMerge != inOnto {
+			return fmt.Errorf("the merge changes the workflow file %s, but its content differs from the commit it merged in (%s); a base merge brings in only what the base branch already has, so refusing the merge", path, shortSHA(onto))
+		}
 	}
 	return nil
+}
+
+// blobHash returns the hash of the blob git stores for path in rev, or the
+// empty string when the path does not exist there (a deletion), so a
+// workflow file the merge deletes compares equal only to one the merged-in
+// commit lacks too. Reading hashes keeps the comparison off the work tree.
+func blobHash(dir, rev, path string) (string, error) {
+	out, err := gitOutput(dir, "ls-tree", rev, "--", path)
+	if err != nil {
+		return "", err
+	}
+	line := strings.TrimSpace(out)
+	if line == "" {
+		return "", nil // the path is not in rev: deleted there
+	}
+	// The line is "<mode> <type> <hash>\t<path>"; the hash ends at the tab,
+	// which a path with spaces cannot move.
+	meta, _, ok := strings.Cut(line, "\t")
+	if !ok {
+		return "", fmt.Errorf("could not parse git ls-tree output for %s in %s", path, shortSHA(rev))
+	}
+	fields := strings.Fields(meta)
+	if len(fields) != 3 {
+		return "", fmt.Errorf("could not parse git ls-tree output for %s in %s", path, shortSHA(rev))
+	}
+	return fields[2], nil
 }
 
 // mergeApproved reports whether the publish job recorded a maintainer's
@@ -890,14 +943,18 @@ func recreateMerge(dir, branch, baseRef string, info *mergeInfo, baseCommit, hea
 	}
 	// The run's workflows flag is untrusted: merge-info.json comes from the
 	// run job, so publish recomputes whether the merge carries the base's
-	// workflow changes itself, over the same two commits the merge was made
-	// from. An error telling the cases apart counts as carrying, as on the
-	// run side. A run that recorded "workflows": false for a merge that does
-	// carry them lied about its merge: refused even if a maintainer approved,
-	// because nothing else it recorded about the merge can be trusted either.
-	carries, wfErr := recomputeWorkflowsCarried(dir, info.Base, info.Onto)
+	// workflow changes itself, over the same range the run used -- the merge
+	// base computed above and the recorded base tip, not the PR head
+	// (info.Base): the head's own workflow edits are already on the branch
+	// and publish nothing new, so counting them would refuse every branch
+	// that edits a workflow file of its own. An error telling the cases
+	// apart counts as carrying, as on the run side. A run that recorded
+	// "workflows": false for a merge that does carry them lied about its
+	// merge: refused even if a maintainer approved, because nothing else it
+	// recorded about the merge can be trusted either.
+	carries, wfErr := recomputeWorkflowsCarried(dir, base, info.Onto)
 	if wfErr == nil && carries && !info.Workflows {
-		return out, fmt.Errorf("the run recorded that its merge carries no workflow changes, but %s and %s differ under .github/workflows/; the run lied about its merge, so refusing it even if a maintainer approved", shortSHA(info.Base), shortSHA(info.Onto))
+		return out, fmt.Errorf("the run recorded that its merge carries no workflow changes, but %s and %s differ under .github/workflows/; the run lied about its merge, so refusing it even if a maintainer approved", shortSHA(base), shortSHA(info.Onto))
 	}
 	// Carrying workflow changes (recomputed or recorded) needs the
 	// maintainer's approval, whatever the run recorded.
@@ -922,22 +979,23 @@ func recreateMerge(dir, branch, baseRef string, info *mergeInfo, baseCommit, hea
 	if err != nil {
 		return out, err
 	}
+	// Issue #16: every workflow path the merge changes relative to the PR
+	// head must be byte-for-byte what the commit it merged in already has --
+	// the recorded base tip (info.Onto), not the base branch's current tip,
+	// which may have moved on since the run. The tree hash above proves the
+	// merge is the one the run recorded; this proves that what it records is
+	// only the base's workflows. The head's own workflow edits are kept:
+	// paths the merge leaves as they are on head are not checked, and a
+	// merge that changes a workflow path into anything but the base tip's
+	// content is refused, whatever the approval said. Checked before the
+	// reset, so a refusal leaves the branch untouched.
+	if carries || info.Workflows {
+		if err := checkMergeWorkflows(dir, head, commit, info.Onto); err != nil {
+			return out, err
+		}
+	}
 	if err := gitRun(dir, "reset", "--hard", commit); err != nil {
 		return out, err
-	}
-	// Issue #16: what the merge carries under .github/workflows/ must be
-	// byte-for-byte what the commit it merged in already has -- the recorded
-	// base tip (info.Onto), not the base branch's current tip, which may
-	// have moved on since the run. The tree hash above proves the merge is
-	// the one the run recorded; this proves that what it records is only the
-	// base's workflows -- a merge whose workflow files differ from the
-	// base branch's is refused, whatever the approval said.
-	if carries || info.Workflows {
-		if wf, err := workflowChanges(dir, commit, info.Onto); err != nil {
-			return out, fmt.Errorf("could not check the recreated merge's workflow files against the recorded base tip %s: %w", shortSHA(info.Onto), err)
-		} else if len(wf) > 0 {
-			return out, fmt.Errorf("the recreated merge's workflow files differ from the recorded base tip %s's (%s); a base merge brings in only what the base branch already has, so refusing the merge", shortSHA(info.Onto), strings.Join(wf, ", "))
-		}
 	}
 	out = mergeOutcome{State: kind, Commit: commit, Tree: tree, Files: files}
 	fmt.Printf("::notice::recreated the run's merge of %s (%s) into %s as %s; tree %s verified\n", baseRef, shortSHA(info.Onto), branch, shortSHA(commit), shortSHA(tree))

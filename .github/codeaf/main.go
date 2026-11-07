@@ -832,13 +832,13 @@ func envOr(name, fallback string) string {
 // upstreamClient builds the http.Client the proxy uses for upstream calls.
 // The 15-minute whole-call timeout is unchanged from before #145, and there
 // has never been a ResponseHeaderTimeout here -- the error that broke
-// infinite mode ("net/http: timeout awaiting response headers") was CodeAF's
+// slow-first-token calls ("net/http: timeout awaiting response headers") was CodeAF's
 // own header deadline against this proxy, which went silent because
 // p.client.Do blocked until upstream's headers arrived and nothing reached
 // the client. The fix is not on this side: doWithHeartbeats (issue #145)
 // commits the 200 and heartbeats through that wait, so the client's header
 // deadline no longer fires, and keeping no ResponseHeaderTimeout here means
-// net/http adds no second, shorter deadline that would cut the mode's
+// net/http adds no second, shorter deadline that would cut a model's
 // 40-236s wait to first token. The call stays bounded only by the whole-call
 // timeout and by the client, which cancels the upstream request when it
 // leaves. TestProductionProxyClientHasNoHeaderTimeout guards this.
@@ -1292,15 +1292,6 @@ func RewriteRequest(body map[string]json.RawMessage, m Model, searchMaxUses int)
 	if raw, ok := body["stream"]; ok {
 		_ = json.Unmarshal(raw, &stream)
 	}
-	if strings.HasPrefix(m.Upstream, "infinite:") {
-		// Issue #452: synthetic.new requires stream:true for infinite-mode
-		// models (the "infinite:" upstream alias), whatever the client sent
-		// -- a non-streaming request dies upstream with a request-shape
-		// error. Force it and take the stream_options branch below, so the
-		// proxy relays the response as a stream too.
-		body["stream"] = json.RawMessage("true")
-		stream = true
-	}
 	if stream {
 		options := map[string]json.RawMessage{}
 		if raw, ok := body["stream_options"]; ok {
@@ -1550,8 +1541,9 @@ type LedgerLine struct {
 	SlotWaitS float64   `json:"slot_wait_s,omitempty"`
 	// HeaderMs is how long the proxy waited for upstream response headers:
 	// the time from issuing the call to the headers arriving (issue #145).
-	// An uncommitted streaming call shows nothing else; in infinite mode this
-	// is the 40-236s wait, so it is the figure that makes the mode readable.
+	// An uncommitted streaming call shows nothing else; for a slow first
+	// token this is the 40-236s wait, so it is the figure that makes such
+	// calls readable.
 	// Old ledgers carry no field and parse back as 0.
 	HeaderMs int64  `json:"header_ms,omitempty"`
 	Kind     string `json:"kind,omitempty"`
@@ -1905,7 +1897,7 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 	// The call starts here, after any wait for a slot; the ledger reads the
 	// duration from this moment to when the call is recorded.
 	started := time.Now()
-	// Issue #145: infinite mode takes 40-236s to its response headers, and
+	// Issue #145: a slow upstream can take 40-236s to its response headers, and
 	// p.client.Do blocked all of it in silence, so CodeAF hedged a second arm
 	// at 30s ("no heartbeat") and timed the turn out at 120s ("timeout
 	// awaiting response headers"). For a streaming call the upstream request
@@ -1930,7 +1922,7 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 			// This one is recorded (issue #456): the request was already
 			// issued upstream and the slot was held for the whole header
 			// wait, so leaving no line made it a phantom -- the abandon
-			// during infinite mode's 40-236 s header wait was in no call
+			// during a slow upstream's 40-236 s header wait was in no call
 			// count, no timing figure and no alert. The line carries the
 			// header wait measured above, no usage and no cost.
 			p.recordAbandoned(abandonedBeforeHeaders, m, stream, slotWait, headerWait)
@@ -2012,8 +2004,8 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 // already in hand (review of #145).
 //
 // headerWait is the time from issuing the request to upstream's response
-// headers -- the figure infinite mode needs and the ledger records as
-// header_ms.
+// headers -- the figure a slow first token needs measured and the ledger
+// records as header_ms.
 func (p *proxy) doWithHeartbeats(ctx context.Context, request *http.Request, w http.ResponseWriter, out **sseSink, stream, streaming bool) (*http.Response, time.Duration, error) {
 	start := time.Now()
 	if !stream || !streaming {
@@ -2167,7 +2159,7 @@ const (
 // answers with a real status (402, 429, any 4xx) still reaches CodeAF as that
 // status, which CodeAF's 429 retry depends on, rather than as an SSE event.
 // An ordinary call's headers arrive well inside it even under load; past it
-// the wait is the long one -- infinite mode's 40-236s to first token -- and
+// the wait is the long one -- a slow first token's 40-236s -- and
 // committing then still beats CodeAF's 30s hedge and 120s header deadline.
 const defaultHeaderWaitGrace = 15 * time.Second
 

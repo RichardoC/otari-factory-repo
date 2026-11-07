@@ -444,10 +444,21 @@ to the staged patch diff only, and every new commit still descends from
 the PR head -- no force-push.
 
 One limit: if the base branch changed anything under `.github/workflows/`
-since the PR branched, the base is **not** brought in, by the run job or by
-`publish`. GitHub refuses a `GITHUB_TOKEN` push that carries workflow
-changes, so the patch is pushed alone, as before, and the PR stays behind
-its base until a maintainer updates the branch.
+since the PR branched, bringing the base in takes a maintainer's approval.
+The run job still computes and commits the merge — clean or conflicted,
+exactly as for any other merge — and records that it carries workflow
+changes as `workflows: true` in `merge-info.json`. When that field is set,
+the workflow routes `publish` into the `codeaf-harness` environment, so a
+maintainer must approve. With approval, `publish` recreates the merge (still
+from the same two parents, still verified by tree hash) and pushes it with
+the GitHub App token, which can carry workflow changes where `GITHUB_TOKEN`
+cannot; it refuses unless the merge's `.github/workflows/` files equal the
+base branch's byte-for-byte, so the merge brings in only what the base
+already has. Without approval, `publish` refuses with an error naming the
+maintainer approval rather than silently pushing the patch alone. When there
+is no `merge-info.json` (the behind and diverged fallbacks), the patch is
+still pushed alone without approval, and the base is merged in as above once
+approved.
 
 ### Keeping CodeAF current (issue #35)
 

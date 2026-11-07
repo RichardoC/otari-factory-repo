@@ -30,6 +30,14 @@
 //	         base's own changes, the squash run 39094290325 published for
 //	         #163 (issue #171).
 //
+// A merge that carries the base branch's .github/workflows/ changes is not
+// skipped (issue #16): the run commits and records it (merge-info.json
+// "workflows": true), the workflow reads that field through "harness
+// merge-default workflows" and routes publish into the approval-gated
+// codeaf-harness environment, and publish recreates it only once a
+// maintainer approved, verifying that its workflow files equal the base
+// branch's byte-for-byte.
+//
 // The invariants hold: `git apply` is still the only thing applied from run;
 // the .github/ approval check still reads the staged patch diff; and every
 // pushed commit descends from the PR head, so there is no force-push.
@@ -71,6 +79,13 @@ type mergeInfo struct {
 	Onto   string   `json:"onto"`   // the base branch tip merged in
 	Tree   string   `json:"tree"`   // the merged tree (carrying markers when conflicted)
 	Files  []string `json:"files"`  // the paths the merge conflicted in
+	// Workflows records that the base branch changed .github/workflows/
+	// between the branch point and the tip the run merged in (issue #16).
+	// Such a merge can only be pushed with the GitHub App token, so the
+	// workflow reads this field (through "harness merge-default workflows",
+	// never parsed in shell) to route publish into the codeaf-harness
+	// environment, and recreateMerge still checks the approval itself.
+	Workflows bool `json:"workflows"`
 }
 
 // mergeOutcome is what a merge phase did, for the workflow steps to read.
@@ -351,8 +366,10 @@ func readMergeInfo(path string) (*mergeInfo, error) {
 // workflowChanges lists the files under .github/workflows/ that differ
 // between from and to. Bringing such changes into a PR branch makes the push
 // a workflow change, which GitHub refuses from GITHUB_TOKEN ("refusing to
-// allow a GitHub App to create or update workflow"), so a merge that would
-// carry any is skipped and the patch is pushed alone, as before #57.
+// allow a GitHub App to create or update workflow"): a merge that carries any
+// goes through the maintainer-approval gate instead of being skipped (issue
+// #16) -- recorded in merge-info.json on the run side, checked against
+// HARNESS_APPROVED on the publish side.
 func workflowChanges(dir, from, to string) ([]string, error) {
 	out, err := gitOutput(dir, "diff", "--no-renames", "--name-only", from, to, "--", ".github/workflows/")
 	if err != nil {
@@ -386,6 +403,41 @@ func unquoteGitPath(line string) string {
 	return strings.Trim(line, `"`)
 }
 
+// runStateFile is the sibling of merge-info.json where runMerge records why
+// it merged nothing, for the brief (issue #16): without merge info the brief
+// would otherwise say nothing, and the agent might merge or copy the base
+// branch by hand, which publish refuses as an unverifiable replay.
+func runStateFile(mergeInfoFile string) string {
+	return mergeInfoFile + ".run"
+}
+
+// mergeNotMade records that the run job merged nothing, and why. The reason
+// is error text, so it is bounded and stripped of control characters: this
+// file is run-job output, untrusted like the rest (AGENTS.md, "Security
+// rules"), and the brief puts it in front of the model. An empty reason (the
+// base tip was already contained in the branch) writes nothing: there is
+// nothing to tell the agent.
+func mergeNotMade(mergeInfoFile, format string, args ...any) {
+	if mergeInfoFile == "" {
+		return
+	}
+	reason := strings.Map(func(r rune) rune {
+		if r < 32 {
+			return -1 // control characters, including newlines
+		}
+		return r
+	}, strings.TrimSpace(fmt.Sprintf(format, args...)))
+	if reason == "" {
+		return
+	}
+	if len(reason) > 300 {
+		reason = reason[:300]
+	}
+	if err := os.WriteFile(runStateFile(mergeInfoFile), []byte("state=none\nreason="+reason+"\n"), 0o644); err != nil {
+		log.Printf("merge-default: could not record why no merge was made: %v", err)
+	}
+}
+
 // runMerge is the run-job half of issue #57: it merges the base branch tip
 // into the PR head branch in the run job's checkout, before CodeAF works. A
 // clean merge is committed as an ordinary merge commit; a conflicted one as a
@@ -403,6 +455,7 @@ func unquoteGitPath(line string) string {
 func runMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile string, compare compareFunc) (mergeOutcome, error) {
 	out := mergeOutcome{State: "none"}
 	if branch == "" || baseRef == "" {
+		mergeNotMade(mergeInfoFile, "no branch or base branch was named")
 		log.Printf("merge-default: no branch or base branch named; nothing to merge")
 		return out, nil
 	}
@@ -414,10 +467,12 @@ func runMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile string, compar
 	// this checkout on it, and anything else is a state worth stopping for.
 	ref, err := gitOutput(dir, "symbolic-ref", "--short", "HEAD")
 	if err != nil || strings.TrimSpace(ref) != branch {
+		mergeNotMade(mergeInfoFile, "the checkout is not on the branch %q (it is on %q), so the base was not merged in", branch, strings.TrimSpace(ref))
 		log.Printf("merge-default: HEAD is on %s, not %s; nothing to merge", strings.TrimSpace(ref), branch)
 		return out, nil
 	}
 	if err := fetchRef(dir, baseRef); err != nil {
+		mergeNotMade(mergeInfoFile, "the base branch %s could not be fetched: %v", baseRef, err)
 		log.Printf("merge-default: could not fetch %s (%v); continuing without bringing it in", baseRef, err)
 		return out, nil
 	}
@@ -430,6 +485,7 @@ func runMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile string, compar
 	}
 	cmp, err := compare(head, onto)
 	if err != nil {
+		mergeNotMade(mergeInfoFile, "the branch could not be compared with %s: %v", baseRef, err)
 		log.Printf("merge-default: could not compare the branch with %s (%v); continuing without a merge", baseRef, err)
 		return out, nil
 	}
@@ -447,24 +503,43 @@ func runMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile string, compar
 		base = head
 	case cmp.Status == "diverged":
 		if cmp.MergeBase == "" || !isSHA(cmp.MergeBase) {
+			mergeNotMade(mergeInfoFile, "the compare API named no merge base for %s and %s", shortSHA(head), shortSHA(onto))
 			log.Printf("merge-default: the compare API named no merge base; continuing without a merge")
 			return out, nil
 		}
 		base = cmp.MergeBase
 	default:
+		mergeNotMade(mergeInfoFile, "the compare API returned an unexpected status %q", cmp.Status)
 		log.Printf("merge-default: unexpected compare status %q; continuing without a merge", cmp.Status)
 		return out, nil
 	}
 	if err := fetchCommit(dir, base); err != nil {
+		mergeNotMade(mergeInfoFile, "the merge base %s could not be fetched: %v", shortSHA(base), err)
 		log.Printf("merge-default: could not fetch the merge base %s (%v); continuing without a merge", shortSHA(base), err)
 		return out, nil
 	}
-	if wf, err := workflowChanges(dir, base, onto); err != nil || len(wf) > 0 {
-		log.Printf("merge-default: %s changed workflows since the branch point (%v); the push token cannot carry them, so continuing without a merge", baseRef, wf)
-		return out, nil
+	// Issue #16: the base having changed .github/workflows/ no longer skips
+	// the merge. Such a merge can only be pushed with the GitHub App token,
+	// so it is recorded as merge-info.json "workflows": true and the
+	// workflow routes publish into the approval-gated codeaf-harness
+	// environment; publish re-checks the approval itself and verifies that
+	// the merge brings in only what the base branch already has. An error
+	// telling the cases apart counts as "changed": the merge still happens,
+	// and publish may wait for an approval it did not need, rather than a
+	// push GitHub would refuse.
+	carryWorkflows := false
+	if wf, err := workflowChanges(dir, base, onto); err != nil {
+		log.Printf("merge-default: could not tell whether %s changed workflows since the branch point (%v); recording that it may have", baseRef, err)
+		carryWorkflows = true
+	} else {
+		carryWorkflows = len(wf) > 0
+	}
+	if carryWorkflows {
+		log.Printf("merge-default: %s changed workflows since the branch point; the merge goes through, and publishing it waits for a maintainer approval", baseRef)
 	}
 	tree, files, conflicted, err := mergeTree(dir, base, head, onto)
 	if err != nil {
+		mergeNotMade(mergeInfoFile, "the merge could not be computed: %v", err)
 		log.Printf("merge-default: could not compute the merge (%v); continuing without one", err)
 		return out, nil
 	}
@@ -476,10 +551,12 @@ func runMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile string, compar
 	}
 	commit, err := commitMerge(dir, tree, head, onto, message)
 	if err != nil {
+		mergeNotMade(mergeInfoFile, "the merge commit could not be committed: %v", err)
 		log.Printf("merge-default: could not commit the merge (%v); continuing without one", err)
 		return out, nil
 	}
 	if err := gitRun(dir, "reset", "--hard", commit); err != nil {
+		mergeNotMade(mergeInfoFile, "the merge commit could not be checked out: %v", err)
 		log.Printf("merge-default: could not check the merge out (%v); continuing without one", err)
 		return out, nil
 	}
@@ -489,13 +566,18 @@ func runMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile string, compar
 	if err := os.WriteFile(baseCommitFile, []byte(commit+"\n"), 0o644); err != nil {
 		return out, fmt.Errorf("wrote the merge commit but could not record it as the base commit: %w", err)
 	}
-	info := mergeInfo{Kind: kind, Commit: commit, Base: head, Onto: onto, Tree: tree, Files: files}
+	info := mergeInfo{Kind: kind, Commit: commit, Base: head, Onto: onto, Tree: tree, Files: files, Workflows: carryWorkflows}
 	data, err := json.MarshalIndent(info, "", "  ")
 	if err != nil {
 		return out, err
 	}
 	if err := os.WriteFile(mergeInfoFile, append(data, '\n'), 0o644); err != nil {
 		return out, fmt.Errorf("wrote the merge commit but could not record the merge info: %w", err)
+	}
+	// A merge info from an earlier attempt in this checkout would leave the
+	// brief reporting a no-merge that no longer is one.
+	if err := os.Remove(runStateFile(mergeInfoFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return out, fmt.Errorf("wrote the merge commit but could not clear the no-merge record: %w", err)
 	}
 	if conflicted {
 		list := strings.Join(files, ", ")
@@ -505,6 +587,9 @@ func runMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile string, compar
 		fmt.Printf("::notice::merged %s (%s) into %s with conflicts; CodeAF must resolve: %s\n", baseRef, shortSHA(onto), branch, list)
 	} else {
 		fmt.Printf("::notice::merged %s (%s) into %s cleanly\n", baseRef, shortSHA(onto), branch)
+	}
+	if carryWorkflows {
+		fmt.Printf("::notice::the merge carries %s workflow changes; publishing it waits for a maintainer approval (the codeaf-harness environment)\n", baseRef)
 	}
 	return out, nil
 }
@@ -583,8 +668,11 @@ func publishMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile, stateFile
 		if err := refuseReplayedBaseMerge(dir, patchPath, head, onto); err != nil {
 			return out, err
 		}
-		if wf, err := workflowChanges(dir, head, onto); err != nil || len(wf) > 0 {
-			log.Printf("merge-default: %s changed workflows (%v); the push token cannot carry them, so pushing the patch without the merge", baseRef, wf)
+		// Issue #16: with a maintainer's approval the merge goes through --
+		// the push step then uses the GitHub App token, which can carry the
+		// workflow changes. Without one the patch is pushed alone, as before.
+		if wf, err := workflowChanges(dir, head, onto); (err != nil || len(wf) > 0) && !mergeApproved() {
+			log.Printf("merge-default: %s changed workflows (%v); without a maintainer approval the push token cannot carry them, so pushing the patch without the merge", baseRef, wf)
 			return out, nil
 		}
 		tree, _, conflicted, err := mergeTree(dir, head, head, onto)
@@ -628,8 +716,11 @@ func publishMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile, stateFile
 	if err := refuseReplayedBaseMerge(dir, patchPath, base, onto); err != nil {
 		return out, err
 	}
-	if wf, err := workflowChanges(dir, base, onto); err != nil || len(wf) > 0 {
-		log.Printf("merge-default: %s changed workflows since the branch point (%v); the push token cannot carry them, so pushing the patch without the merge", baseRef, wf)
+	// Issue #16: with a maintainer's approval the merge goes through -- the
+	// push step then uses the GitHub App token, which can carry the workflow
+	// changes. Without one the patch is pushed alone, as before.
+	if wf, err := workflowChanges(dir, base, onto); (err != nil || len(wf) > 0) && !mergeApproved() {
+		log.Printf("merge-default: %s changed workflows since the branch point (%v); without a maintainer approval the push token cannot carry them, so pushing the patch without the merge", baseRef, wf)
 		return out, nil
 	}
 	tree, _, conflicted, err := mergeTree(dir, base, head, onto)
@@ -658,15 +749,49 @@ func publishMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile, stateFile
 	return out, nil
 }
 
+// mergeWorkflowsRouting reads, for the run job's packaging step, whether the
+// recorded merge carries the base branch's workflow changes (issue #16):
+// merge info through the validating reader, so the workflow never parses the
+// file in shell. A missing file reads false; one that exists but does not
+// validate is an error, not a silent false.
+func mergeWorkflowsRouting(path string) (bool, error) {
+	info, err := readMergeInfo(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return info.Workflows, nil
+}
+
+// mergeApproved reports whether the publish job recorded a maintainer's
+// approval of this run: "Check the maintainer's approval" verified through
+// the API that someone with admin or maintain access approved the
+// codeaf-harness environment for this run, and set HARNESS_APPROVED=true.
+// Only that checked value counts; the run job's routing output never does.
+func mergeApproved() bool {
+	return envOr("HARNESS_APPROVED", "") == "true"
+}
+
 // recreateMerge rebuilds the merge the run job committed, from the same two
 // parents, and refuses unless everything checks out: the recorded base is the
 // branch head publish fetched, the recorded commit is the run's base commit,
 // the base tip it merged is a commit the base branch contains (anything else
 // could smuggle content into the merge under the cover of "bringing the base
 // in"), and the tree of the merge publish computes itself matches the
-// recorded tree.
+// recorded tree. A merge the run recorded as carrying the base branch's
+// workflow changes (issue #16) is recreated only when a maintainer approved
+// this run: the push then uses the GitHub App token, which GitHub lets carry
+// workflow files, and the recreated merge's .github/workflows/ must equal the
+// base branch's byte-for-byte -- the merge brings in only what main already
+// has, never a workflow edit of the branch's own (that travels in the patch,
+// where the approval check and the workflow policy see it).
 func recreateMerge(dir, branch, baseRef string, info *mergeInfo, baseCommit, head string, compare compareFunc) (mergeOutcome, error) {
 	out := mergeOutcome{State: "none"}
+	if info.Workflows && !mergeApproved() {
+		return out, errors.New("the recorded merge carries the base branch's workflow changes, and publishing one needs a maintainer's approval of the codeaf-harness environment (HARNESS_APPROVED, checked through the API); no maintainer approved this run, so refusing the merge")
+	}
 	if info.Base != head {
 		return out, fmt.Errorf("the merge info names base %s but the branch head is %s; refusing a merge made against another commit", shortSHA(info.Base), shortSHA(head))
 	}
@@ -742,6 +867,18 @@ func recreateMerge(dir, branch, baseRef string, info *mergeInfo, baseCommit, hea
 	}
 	if err := gitRun(dir, "reset", "--hard", commit); err != nil {
 		return out, err
+	}
+	// Issue #16: what the merge carries under .github/workflows/ must be
+	// what the base branch already has, byte-for-byte. The tree hash above
+	// proves the merge is the one the run recorded; this proves that what it
+	// records is only the base's workflows -- a merge whose workflow files
+	// differ from the base branch's is refused, whatever the approval said.
+	if info.Workflows {
+		if wf, err := workflowChanges(dir, commit, tip); err != nil {
+			return out, fmt.Errorf("could not check the recreated merge's workflow files against %s: %w", baseRef, err)
+		} else if len(wf) > 0 {
+			return out, fmt.Errorf("the recreated merge's workflow files differ from %s's (%s); a base merge brings in only what the base branch already has, so refusing the merge", baseRef, strings.Join(wf, ", "))
+		}
 	}
 	out = mergeOutcome{State: kind, Commit: commit, Tree: tree, Files: files}
 	fmt.Printf("::notice::recreated the run's merge of %s (%s) into %s as %s; tree %s verified\n", baseRef, shortSHA(info.Onto), branch, shortSHA(commit), shortSHA(tree))
@@ -1048,17 +1185,36 @@ func gitEnvOutput(dir string, env []string, args ...string) (string, error) {
 //	harness merge-default verify STATE_FILE
 //	    publish, after the patch: refuse while a conflict marker remains in a
 //	    conflicted file.
+//	harness merge-default workflows MERGE_INFO_FILE
+//	    run job, packaging: print whether the recorded merge carries the base
+//	    branch's workflow changes (issue #16), so the step routes publish
+//	    into the codeaf-harness environment. The file is read through the
+//	    validating reader, never parsed in shell; a missing file reads false.
 //
-// Every phase is a no-op outside pr mode, so review and issue runs are
+// Every other phase is a no-op outside pr mode, so review and issue runs are
 // untouched; the workflow steps gate on the mode as well.
 func runMergeDefault() error {
 	if len(os.Args) < 3 {
-		return errors.New("usage: harness merge-default run|publish|verify ...")
+		return errors.New("usage: harness merge-default run|publish|verify|workflows ...")
+	}
+	phase, args := os.Args[2], os.Args[3:]
+	// Routing reads merge info in modes that merge nothing (a patch-only
+	// issue run has no merge info and reads false), so this phase does not
+	// gate on pr mode.
+	if phase == "workflows" {
+		if len(args) != 1 {
+			return errors.New("usage: harness merge-default workflows MERGE_INFO_FILE")
+		}
+		routed, err := mergeWorkflowsRouting(args[0])
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%t\n", routed)
+		return nil
 	}
 	if envOr("MODE", "") != "pr" {
 		return nil
 	}
-	phase, args := os.Args[2], os.Args[3:]
 	branch, baseRef := os.Getenv("BRANCH"), os.Getenv("BASE")
 	switch phase {
 	case "run":
@@ -1091,9 +1247,11 @@ func runMergeDefault() error {
 
 // mergeBriefSection renders the brief's paragraph about the base-branch merge
 // (issue #57). A missing file is the normal case: the run merged nothing, and
-// the brief says nothing. A conflicted merge that cannot be read is an error,
-// because CodeAF would otherwise work on files carrying markers it was never
-// told about.
+// the brief then says why, when the run recorded a reason beside it (issue
+// #16) -- so CodeAF does not merge or copy the base branch by hand, which
+// publish refuses as an unverifiable replay. A conflicted merge that cannot
+// be read is an error, because CodeAF would otherwise work on files carrying
+// markers it was never told about.
 func mergeBriefSection(path string) (string, error) {
 	if path == "" {
 		return "", nil
@@ -1101,7 +1259,7 @@ func mergeBriefSection(path string) (string, error) {
 	info, err := readMergeInfo(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return "", nil
+			return noMergeBriefSection(runStateFile(path))
 		}
 		return "", err
 	}
@@ -1124,5 +1282,45 @@ func mergeBriefSection(path string) (string, error) {
 			"so nothing conflicts. Your diff is measured against that merge commit: files the merge changed are part of the "+
 			"branch now, not of your patch, unless you edit them.\n", shortSHA(info.Onto))
 	}
+	if info.Workflows {
+		fmt.Fprintf(&b, "\nThe merge carries the base branch's workflow changes, so publishing this branch waits for a "+
+			"maintainer's approval of the codeaf-harness environment; that is expected, and not something you act on.\n")
+	}
 	return strings.TrimRight(b.String(), "\n"), nil
+}
+
+// noMergeBriefSection renders the brief's paragraph for a base merge the run
+// job could not make (issue #16). The record is run-job output and untrusted:
+// the reason is re-bounded here, and a missing or empty record (the base tip
+// was already contained in the branch) says nothing.
+func noMergeBriefSection(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		return "", err
+	}
+	reason := ""
+	for _, line := range strings.Split(string(data), "\n") {
+		if v, ok := strings.CutPrefix(line, "reason="); ok {
+			reason = strings.Map(func(r rune) rune {
+				if r < 32 || r == 127 {
+					return -1
+				}
+				return r
+			}, strings.TrimSpace(v))
+			if len(reason) > 300 {
+				reason = reason[:300]
+			}
+		}
+	}
+	if reason == "" {
+		return "", nil
+	}
+	return "## The base branch was not merged into this branch\n\n" +
+		fmt.Sprintf("The run job could not merge the base branch into this branch (%s).\n\n", reason) +
+		"Do not merge the base branch and do not copy its changes by hand: publish refuses a patch that replays " +
+		"base-branch changes it cannot verify as a merge. Work on the branch as it is, make only this task's changes, " +
+		"and say in your result that the pull request still needs to catch up with its base branch.\n", nil
 }

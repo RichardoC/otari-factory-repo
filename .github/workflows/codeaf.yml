@@ -441,9 +441,22 @@ jobs:
             > "$RUNNER_TEMP/out/changes.patch"
           echo "Patch: $(wc -c < "$RUNNER_TEMP/out/changes.patch") bytes"
           outside=$(git -c core.hooksPath=/dev/null diff --cached --no-renames --name-only HEAD | grep '^\.github/' | grep -v '^\.github/codeaf/' || true)
-          if [ -n "$outside" ]; then
+          # Issue #16: a base merge that carries the base branch's workflow
+          # changes can only be pushed with the GitHub App token, so it routes
+          # here too. The field is read through the harness binary, which
+          # validates merge info -- never parsed in shell. No merge info (the
+          # run merged nothing) reads false.
+          merge_workflows=false
+          if [ -f "$RUNNER_TEMP/out/merge-info.json" ]; then
+            merge_workflows=$("$HARNESS" merge-default workflows "$RUNNER_TEMP/out/merge-info.json")
+          fi
+          if [ -n "$outside" ] || [ "$merge_workflows" = true ]; then
             echo "touches_harness=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::the patch changes .github/ outside .github/codeaf/; publishing waits for a maintainer's approval"
+            if [ "$merge_workflows" = true ]; then
+              echo "::notice::publishing waits for a maintainer's approval (the patch changes .github/ outside .github/codeaf/, or the base merge carries workflow changes)"
+            else
+              echo "::notice::the patch changes .github/ outside .github/codeaf/; publishing waits for a maintainer's approval"
+            fi
           fi
 
       - name: Pack CodeAF's state

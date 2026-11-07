@@ -453,12 +453,27 @@ maintainer must approve. With approval, `publish` recreates the merge (still
 from the same two parents, still verified by tree hash) and pushes it with
 the GitHub App token, which can carry workflow changes where `GITHUB_TOKEN`
 cannot; it refuses unless the merge's `.github/workflows/` files equal the
-base branch's byte-for-byte, so the merge brings in only what the base
+recorded base tip's byte-for-byte, so the merge brings in only what the base
 already has. Without approval, `publish` refuses with an error naming the
 maintainer approval rather than silently pushing the patch alone. When there
 is no `merge-info.json` (the behind and diverged fallbacks), the patch is
 still pushed alone without approval, and the base is merged in as above once
 approved.
+
+The `workflows` field is untrusted input from the `run` job, so `publish`
+never trusts it: it recomputes whether the recreated merge carries workflow
+changes itself, requires the approval whenever the recomputed list is
+non-empty or the field is set, and refuses -- even with an approval -- a run
+that recorded `workflows: false` for a merge that does carry them. The field,
+like `touches_harness`, only routes the job. The byte check compares the
+merge with the base tip the run actually merged in, not the base branch's
+current tip.
+
+A consequence: a PR branch with its own edits under `.github/workflows/`
+cannot catch up with its base through this path, because its workflow files
+will never equal the base's -- a merge would keep the branch's edits
+where the approval check and the workflow policy cannot see them. Such a PR
+needs a person to merge the base by hand.
 
 ### Keeping CodeAF current (issue #35)
 

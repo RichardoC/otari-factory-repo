@@ -516,9 +516,9 @@ func TestLedgerRecordsUpstreamStatus(t *testing.T) {
 	m := mustResolve(t, testModels(t), "zai-org/glm-5.3-flash")
 	p := &proxy{ledger: filepath.Join(t.TempDir(), "l.jsonl")}
 	usage := Usage{PromptTokens: 10, CompletionTokens: 1}
-	p.record(m, &usage, false, false, time.Now(), 0, 0, charCounts{}, 0, 0, callTiming{})
-	p.record(m, nil, false, true, time.Now(), 0, 0, charCounts{}, 0, 429, callTiming{})
-	p.record(m, nil, false, false, time.Now(), 0, 0, charCounts{}, 0, 500, callTiming{})
+	p.record(m, &usage, false, false, time.Now(), 0, 0, charCounts{}, 0, 0, callTiming{}, 0)
+	p.record(m, nil, false, true, time.Now(), 0, 0, charCounts{}, 0, 429, callTiming{}, 0)
+	p.record(m, nil, false, false, time.Now(), 0, 0, charCounts{}, 0, 500, callTiming{}, 0)
 	lines, err := readLedger(p.ledger)
 	if err != nil {
 		t.Fatal(err)

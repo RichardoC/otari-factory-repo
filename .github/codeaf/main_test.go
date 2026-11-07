@@ -135,7 +135,7 @@ func TestRewriteRequest(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &body); err != nil {
 		t.Fatal(err)
 	}
-	stream, err := RewriteRequest(body, flash)
+	stream, err := RewriteRequest(body, flash, 0)
 	if err != nil || !stream {
 		t.Fatalf("stream=%v err=%v", stream, err)
 	}
@@ -162,7 +162,7 @@ func TestRewriteRequest(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"model":"synthetic/deepseek-v4.1-flash-infinite","messages":[]}`), &body); err != nil {
 		t.Fatal(err)
 	}
-	stream, err = RewriteRequest(body, infinite)
+	stream, err = RewriteRequest(body, infinite, 0)
 	if err != nil || !stream {
 		t.Fatalf("infinite: stream=%v err=%v, want forced streaming", stream, err)
 	}
@@ -179,7 +179,7 @@ func TestRewriteRequest(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"model":"zai-org/glm-5.3-flash","messages":[]}`), &body); err != nil {
 		t.Fatal(err)
 	}
-	stream, err = RewriteRequest(body, flash)
+	stream, err = RewriteRequest(body, flash, 0)
 	if err != nil || stream {
 		t.Fatalf("ordinary: stream=%v err=%v, want false/nil", stream, err)
 	}

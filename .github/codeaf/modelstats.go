@@ -468,8 +468,11 @@ func (in *modelStatsInput) decodeLedgerLine(line []byte, run int, allowed map[st
 		return
 	}
 	// The kinds the proxy writes about itself rather than about a model:
-	// "proxy_start" (recordMarker, main.go) and "search" (search.go:158,
-	// whose model is the fixed id "web-search", not a model in models.json).
+	// "proxy_start" (recordMarker, main.go) and "search" (the forwarded-
+	// search line of issue #58: kind "search", model the fixed id
+	// "web-search", not a model in models.json; issue #2 ended those lines --
+	// searches now count on the call rows -- but old ledgers still carry
+	// them, so they are skipped all the same).
 	// "quotas" is no longer written -- the synthetic.new quota guard is
 	// gone, so there is no recordQuotas -- but ledgers from before that
 	// change still carry it, and it is skipped all the same. These are the

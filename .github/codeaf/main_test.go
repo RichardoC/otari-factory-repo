@@ -33,6 +33,19 @@ func testModels(t *testing.T) []Model {
 	return cfg.Models
 }
 
+// modelByRole returns the models.json model with the given role, read from
+// the config rather than hard-coded, so the tests follow the catalog.
+func modelByRole(t *testing.T, role string) Model {
+	t.Helper()
+	for _, m := range testModels(t) {
+		if m.Role == role {
+			return m
+		}
+	}
+	t.Fatalf("no model with role %q in models.json", role)
+	return Model{}
+}
+
 func mustResolve(t *testing.T, models []Model, id string) Model {
 	t.Helper()
 	m, ok := Resolve(models, id)
@@ -154,24 +167,6 @@ func TestRewriteRequest(t *testing.T) {
 			t.Errorf("%s should have been removed", key)
 		}
 	}
-
-	// Issue #452: an infinite-mode model must be forced to stream, even when
-	// the client sends no "stream" field at all, so the request upstream
-	// requires is what every client sends.
-	infinite := mustResolve(t, testModels(t), "synthetic/deepseek-v4.1-flash-infinite")
-	if err := json.Unmarshal([]byte(`{"model":"synthetic/deepseek-v4.1-flash-infinite","messages":[]}`), &body); err != nil {
-		t.Fatal(err)
-	}
-	stream, err = RewriteRequest(body, infinite, 0)
-	if err != nil || !stream {
-		t.Fatalf("infinite: stream=%v err=%v, want forced streaming", stream, err)
-	}
-	if got := string(body["stream"]); got != "true" {
-		t.Errorf("infinite: stream = %s, want forced true", got)
-	}
-	if got := string(body["stream_options"]); got != `{"include_usage":true}` {
-		t.Errorf("infinite: stream_options = %s, want include_usage", got)
-	}
 	// An ordinary model with no "stream" field is untouched: no field added,
 	// no stream_options, and the proxy relays a non-streaming response. A
 	// fresh map: Unmarshal into the old one would keep the forced "stream".
@@ -188,6 +183,40 @@ func TestRewriteRequest(t *testing.T) {
 	}
 	if _, ok := body["stream_options"]; ok {
 		t.Error("ordinary: stream_options should stay unset")
+	}
+}
+
+// TestModelCatalogIdRoleSet pins the models.json catalog to exactly the
+// models the factory uses: one per lane (base, mid, top) and the
+// experiment-role pool. A model the factory stops using (one Otari will not
+// serve, say) must be removed here, and any added model must be added here,
+// so the set cannot drift silently.
+func TestModelCatalogIdRoleSet(t *testing.T) {
+	want := map[string]string{
+		"zai-org/glm-5.3-flash":                "base",
+		"deepseek-ai/deepseek-v4.1-flash-1017": "mid",
+		"moonshotai/kimi-k3.1-pro":             "top",
+		"zai-org/glm-5.3":                      "experiment",
+		"moonshotai/kimi-k3":                   "experiment",
+		"openai/gpt-oss-120b":                  "experiment",
+		"zai-org/glm-4.7-flash":                "experiment",
+	}
+	got := map[string]string{}
+	for _, m := range testModels(t) {
+		got[m.ID] = m.Role
+	}
+	if len(got) != len(testModels(t)) {
+		t.Fatal("duplicate model id in models.json")
+	}
+	for id, role := range want {
+		if got[id] != role {
+			t.Errorf("model %s role = %q, want %q", id, got[id], role)
+		}
+	}
+	for id := range got {
+		if _, ok := want[id]; !ok {
+			t.Errorf("unexpected model in models.json: %s (role %s)", id, got[id])
+		}
 	}
 }
 
@@ -3636,8 +3665,8 @@ func splitUnescapedPipes(row string) []string {
 // Issue #145: a streaming call whose upstream takes its time over the response
 // headers. Before this change the proxy wrote nothing until those headers
 // arrived, so CodeAF read the silence as a dead path, hedged a second arm and
-// then timed the turn out with "timeout awaiting response headers" (infinite
-// mode's 40-236s to first token).
+// then timed the turn out with "timeout awaiting response headers" (a slow
+// first token's 40-236s).
 
 // proxyFor145 builds a proxy around an upstream handler, with the heartbeat
 // interval shortened to the test's.
@@ -3647,51 +3676,6 @@ func proxyFor145(t *testing.T, modelID string, interval time.Duration, upstream 
 	return &proxy{upstream: upstream.URL, apiKey: "k", ledger: filepath.Join(t.TempDir(), "l.jsonl"),
 		runCap: 5, weekCap: 20, models: models, client: upstream.Client(),
 		slots: newSlots(models, 1), heartbeatEvery: interval, headerGrace: time.Second}
-}
-
-// TestProxyForcesStreamingForInfiniteModel (issue #452): synthetic.new
-// requires stream:true for infinite-mode models, so the proxy must add it to a
-// non-streaming client request and relay the answer as a stream. The ordinary
-// model case (stream stays unset) is covered at the RewriteRequest level.
-func TestProxyForcesStreamingForInfiniteModel(t *testing.T) {
-	var seen map[string]any
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seen = map[string]any{}
-		_ = json.NewDecoder(r.Body).Decode(&seen)
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, `data: {"choices":[{"delta":{"content":"hi"}}],"model":"x"}`+"\n\n")
-		_, _ = io.WriteString(w, "data: [DONE]\n\n")
-	}))
-	defer upstream.Close()
-
-	p := proxyFor145(t, "synthetic/deepseek-v4.1-flash-infinite", 20*time.Millisecond, upstream)
-	server := httptest.NewServer(p)
-	defer server.Close()
-
-	// No "stream" field in the client request at all.
-	resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
-		strings.NewReader(`{"model":"synthetic/deepseek-v4.1-flash-infinite","messages":[]}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "text/event-stream" {
-		t.Fatalf("response %d %s, want a streamed 200\n%s", resp.StatusCode, resp.Header.Get("Content-Type"), body)
-	}
-	if seen["stream"] != true {
-		t.Errorf("upstream saw stream = %v, want forced true", seen["stream"])
-	}
-	options, _ := seen["stream_options"].(map[string]any)
-	if options == nil || options["include_usage"] != true {
-		t.Errorf("upstream saw stream_options = %v, want include_usage", seen["stream_options"])
-	}
-	got := string(body)
-	for _, want := range []string{`"content":"hi"`, "data: [DONE]"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("stream is not intact: missing %q\n%s", want, got)
-		}
-	}
 }
 
 // TestProxyHeartbeatsWhileWaitingForUpstreamHeaders (issue #145): an upstream
@@ -3985,24 +3969,24 @@ func TestLedgerRecordsHeaderWait(t *testing.T) {
 
 // --- Issue #145 end-to-end stand-in ---------------------------------------
 //
-// The issue's own end-to-end check re-dispatches the baseline-infinite profile
-// on a fresh copy of the jobq experiment issue and greps the run's
+// The issue's own end-to-end check re-dispatches an experiment profile on a
+// fresh copy of the jobq experiment issue and greps the run's
 // logs/calls.jsonl for "timeout awaiting response headers" and for hedges with
 // "reason: no heartbeat". That needs a GitHub Actions dispatch against the
 // merged harness, so it cannot run from this working tree. The two tests below
 // are the closest runner-local equivalent: the first drives the real proxy
-// handler over a real TCP connection against an upstream shaped like
-// infinite:small:vision (a long wait for headers, then a sparse stream), and
-// checks, all at once, the exact consequences the end-to-end check looks for --
-// the client sees a live, committed, beating stream the whole time instead of
-// the silence that made CodeAF hedge and gave net/http a header deadline to
-// fire; the second pins the production client so no header timeout can return.
+// handler over a real TCP connection against a slow upstream (a long wait for
+// headers, then a sparse stream), and checks, all at once, the exact
+// consequences the end-to-end check looks for -- the client sees a live,
+// committed, beating stream the whole time instead of the silence that made
+// CodeAF hedge and gave net/http a header deadline to fire; the second pins
+// the production client so no header timeout can return.
 
-// TestProxyEndToEndInfiniteModeSlowHeaders (issue #145) is the in-repo
-// stand-in for the issue's end-to-end check. It builds the real proxy handler
-// (httptest.NewServer(&proxy{...})) against a fake upstream that mimics
-// infinite:small:vision: it sleeps 3x the heartbeat interval -- scaled from the
-// 236s the mode has taken -- before writing its headers, then streams data
+// TestProxyEndToEndSlowHeaders (issue #145) is the in-repo stand-in for the
+// issue's end-to-end check. It builds the real proxy handler
+// (httptest.NewServer(&proxy{...})) against a fake upstream shaped like a slow
+// first token: it sleeps 3x the heartbeat interval -- scaled from the 236s a
+// slow upstream has taken -- before writing its headers, then streams data
 // lines slowly, with gaps longer than the heartbeat interval in between. It
 // asserts, all at once, that:
 //
@@ -4016,8 +4000,8 @@ func TestLedgerRecordsHeaderWait(t *testing.T) {
 //     alive between data lines);
 //   - the stream is intact and ends with [DONE];
 //   - the ledger line for the call carries a non-zero header_ms close to the
-//     header sleep (infinite-mode latency is measurable from the ledger).
-func TestProxyEndToEndInfiniteModeSlowHeaders(t *testing.T) {
+//     header sleep (slow-first-token latency is measurable from the ledger).
+func TestProxyEndToEndSlowHeaders(t *testing.T) {
 	const interval = 20 * time.Millisecond
 	// Scaled from the 236s the mode has really taken: long enough that the
 	// proxy must commit and beat while it waits, short enough to test.
@@ -4057,8 +4041,10 @@ func TestProxyEndToEndInfiniteModeSlowHeaders(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	// The production model id and upstream: the experiment's profile.
-	p := proxyFor145(t, "synthetic/deepseek-v4.1-flash-infinite", interval, upstream)
+	// A still-configured production model: the mid lane's model, read from
+	// models.json by role rather than hard-coded.
+	mid := modelByRole(t, "mid")
+	p := proxyFor145(t, mid.ID, interval, upstream)
 	server := httptest.NewServer(p)
 	defer server.Close()
 
@@ -4067,9 +4053,9 @@ func TestProxyEndToEndInfiniteModeSlowHeaders(t *testing.T) {
 	client := &http.Client{Timeout: 15 * time.Minute}
 	startedAt := time.Now()
 	resp, err := client.Post(server.URL+"/v1/chat/completions", "application/json",
-		strings.NewReader(`{"model":"synthetic/deepseek-v4.1-flash-infinite","stream":true,"messages":[]}`))
+		strings.NewReader(`{"model":"`+mid.ID+`","stream":true,"messages":[]}`))
 	if err != nil {
-		t.Fatalf("the call failed the way infinite mode used to: %v", err)
+		t.Fatalf("the call failed the way a slow upstream used to: %v", err)
 	}
 	defer resp.Body.Close()
 
@@ -4134,7 +4120,7 @@ func TestProxyEndToEndInfiniteModeSlowHeaders(t *testing.T) {
 		}
 	}
 	// The model id must come back as CodeAF's, not the upstream's.
-	if !strings.Contains(got, `"model":"synthetic/deepseek-v4.1-flash-infinite"`) {
+	if !strings.Contains(got, `"model":"`+mid.ID+`"`) {
 		t.Errorf("model id not rewritten back to CodeAF's:\n%s", got)
 	}
 
@@ -4205,16 +4191,16 @@ func TestProductionProxyClientHasNoHeaderTimeout(t *testing.T) {
 		t.Fatal("upstreamClient() returned nil")
 	}
 	// The whole-call budget: an upper bound must exist, and it must be far
-	// beyond infinite mode's 40-236s wait for headers, or the call would time
-	// out on the whole-call deadline instead. 15 minutes is the production
-	// figure.
+	// beyond a slow upstream's 40-236s wait for headers, or the call would
+	// time out on the whole-call deadline instead. 15 minutes is the
+	// production figure.
 	if c.Timeout < 5*time.Minute {
-		t.Errorf("client whole-call Timeout = %v, want at least 5m so infinite mode's 236s header wait fits", c.Timeout)
+		t.Errorf("client whole-call Timeout = %v, want at least 5m so a slow upstream's 236s header wait fits", c.Timeout)
 	}
 	// ResponseHeaderTimeout lives on http.Transport. The proxy client must be
 	// left on the default transport (Transport == nil), which has no
 	// ResponseHeaderTimeout; a custom transport is exactly how the header
-	// deadline that broke infinite mode would come back.
+	// deadline that broke slow first tokens would come back.
 	if c.Transport != nil {
 		if tr, ok := c.Transport.(*http.Transport); ok {
 			if tr.ResponseHeaderTimeout != 0 {

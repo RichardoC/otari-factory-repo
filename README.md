@@ -208,16 +208,8 @@ weekly-budget key, and `daily_budget_usd`'s window is a single run's lifetime, s
 it is set to 20 (the weekly credit, the closest match) with `models.crew.cap` 20;
 `task_cap` 5 matches `run_credit_usd`.
 
-**Fast and Infinite modes (beta) — follow-up only, nothing enabled.** Fast mode is
-not enabled on the account and is not requested: the goal is more tickets, not
-faster ones. Infinite mode is a proposed follow-up: its requests never count against
-the rate limit, run outside the quota but much slower, and are DeepSeek-V4.1-Flash
-only — a way to add review/planner capacity without using the weekly credit. A
-request opts in per request: per the API docs (checked 2026-10-17,
-[dev.synthetic.new/docs/api/models](https://dev.synthetic.new/docs/api/models)), by
-sending the model as the `infinite:` alias (`infinite:small:vision` resolves to
-DeepSeek-V4.1-Flash), which requires `stream: true` and a Big plan. The `:flex`
-model suffix suggested in the issue is not documented anywhere reachable.
+**Fast and Infinite modes: not used.** Neither is enabled on the account or
+configured in `models.json`, and no experiment profile names them.
 
 ## Adding an app
 
@@ -379,9 +371,8 @@ A profile pins the worker, planner and checker seats to models from
 `/codeaf` comments never start an experiment issue, and a profile on any
 other issue is refused. A profile run gets no independent review and no
 continuation, so each result is that profile's unaided work. Models with
-role `experiment` (GLM-5.3, Kimi-K3, GPT-OSS-120B, Qwen3.8-27B,
-GLM-4.7-Flash, DeepSeek-V4.1-Flash in infinite mode) are allowed by the
-proxy but never picked as a lane's worker.
+role `experiment` (GLM-5.3, Kimi-K3, GPT-OSS-120B, GLM-4.7-Flash) are
+allowed by the proxy but never picked as a lane's worker.
 
 ### Runs that stop early (issue #31)
 

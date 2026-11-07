@@ -401,10 +401,11 @@ func TestProposalBodyWorkflowsNote(t *testing.T) {
 	if body := ProposalBody(p); strings.Contains(body, approvalNote) {
 		t.Errorf("the note duplicated the planner's statement of the requirement:\n%s", body)
 	}
-	// A mention of the codeaf-harness environment states it too.
-	p = Proposal{Title: "t", Problem: "gate .github/workflows/deploy.yml on the codeaf-harness environment", What: "edit the workflow"}
-	if body := ProposalBody(p); strings.Contains(body, approvalNote) {
-		t.Errorf("the codeaf-harness mention did not suppress the note:\n%s", body)
+	// Merely naming the codeaf-harness environment does not state the
+	// requirement (issue #4): the note is still added.
+	p = Proposal{Title: "t", Problem: "change codeaf-harness reviewers in .github/workflows/codeaf.yml", What: "edit the reviewers list"}
+	if body := ProposalBody(p); !strings.Contains(body, approvalNote) {
+		t.Errorf("a codeaf-harness mention wrongly suppressed the note:\n%s", body)
 	}
 	// A plain proposal that names no gated path carries none.
 	if body := ProposalBody(Proposal{Title: "t", Problem: "app/widgets/queue.go", What: "add a retry"}); strings.Contains(body, approvalNote) {

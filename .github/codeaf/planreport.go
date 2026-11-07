@@ -428,14 +428,14 @@ func ProposalBody(p Proposal) string {
 // requirement itself, rather than merely using the word "approval" (issue #4):
 // a bare substring let an unrelated phrase like "the approval job" defeat the
 // note. text is already lower-cased. The phrases are the ways the planner is
-// told to phrase the requirement, plus a mention of the codeaf-harness
-// environment whose deployment approval is the gate.
+// told to phrase the requirement. A proposal that merely names the
+// codeaf-harness environment does not state it (issue #4, owner decision):
+// it must still carry the note.
 func statesApprovalRequirement(text string) bool {
 	for _, phrase := range []string{
 		"maintainer's approval",
 		"maintainer’s approval", // curly apostrophe variant
 		"approval before merging",
-		"codeaf-harness",
 	} {
 		if strings.Contains(text, phrase) {
 			return true

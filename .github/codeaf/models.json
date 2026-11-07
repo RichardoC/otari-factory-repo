@@ -137,23 +137,6 @@
       "efforts_note": "role experiment: never picked by a lane, only by a model-experiment profile (experiments.json). Added 2026-11-05 from synthetic.new's /openai/v1/models. Whether it honours reasoning_effort is unverified, so the efforts list is a conservative guess."
     },
     {
-      "id": "qwen/qwen3.8-27b",
-      "upstream": "hf:Qwen/Qwen3.8-27B",
-      "max_concurrent": 8,
-      "name": "Qwen3.8-27B (synthetic.new via Otari)",
-      "role": "experiment",
-      "input": 0.23,
-      "output": 1.10,
-      "cache_read": 0.05,
-      "api_input": 0.45,
-      "api_cached": 0.09,
-      "api_output": 2.20,
-      "context_length": 262144,
-      "input_modalities": ["text", "image"],
-      "efforts": ["medium"],
-      "efforts_note": "role experiment: never picked by a lane, only by a model-experiment profile (experiments.json). Added 2026-11-05 from synthetic.new's /openai/v1/models. Whether it honours reasoning_effort is unverified, so efforts carries a single value -- the validator refuses an empty list, and with one effort every reasoning request maps to medium."
-    },
-    {
       "id": "zai-org/glm-4.7-flash",
       "upstream": "hf:zai-org/GLM-4.7-Flash",
       "max_concurrent": 8,
@@ -169,23 +152,6 @@
       "input_modalities": ["text"],
       "efforts": ["medium"],
       "efforts_note": "role experiment: never picked by a lane, only by a model-experiment profile (experiments.json). Added 2026-11-05 from synthetic.new's /openai/v1/models. Whether it honours reasoning_effort is unverified, so efforts carries a single value -- the validator refuses an empty list, and with one effort every reasoning request maps to medium."
-    },
-    {
-      "id": "synthetic/deepseek-v4.1-flash-infinite",
-      "upstream": "infinite:small:vision",
-      "max_concurrent": 8,
-      "name": "DeepSeek-V4.1-Flash, infinite mode (synthetic.new via Otari)",
-      "role": "experiment",
-      "input": 0,
-      "output": 0,
-      "cache_read": 0,
-      "api_input": 0,
-      "api_cached": 0,
-      "api_output": 0,
-      "context_length": 524288,
-      "input_modalities": ["text", "image"],
-      "efforts": ["none", "low", "high", "xhigh", "max"],
-      "efforts_note": "role experiment: never picked by a lane. synthetic.new's infinite mode (Big plan, beta): the same DeepSeek-V4.1-Flash weights, free and not counted against the weekly credit, but much slower, with long pauses mid-stream; requests must stream. Prices are 0 because it draws no credit."
     }
   ]
 }

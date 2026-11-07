@@ -21,11 +21,6 @@
       "planner": "moonshotai/kimi-k3.1-pro",
       "checker": "moonshotai/kimi-k3.1-pro"
     },
-    "infinite": {
-      "worker": "synthetic/deepseek-v4.1-flash-infinite",
-      "planner": "synthetic/deepseek-v4.1-flash-infinite",
-      "checker": "synthetic/deepseek-v4.1-flash-infinite"
-    },
     "deepseek-1017": {
       "worker": "deepseek-ai/deepseek-v4.1-flash-1017",
       "planner": "deepseek-ai/deepseek-v4.1-flash-1017",
@@ -35,11 +30,6 @@
       "worker": "moonshotai/kimi-k3.1-pro",
       "planner": "deepseek-ai/deepseek-v4.1-flash-1017",
       "checker": "deepseek-ai/deepseek-v4.1-flash-1017"
-    },
-    "baseline-infinite": {
-      "worker": "zai-org/glm-5.3-flash",
-      "planner": "synthetic/deepseek-v4.1-flash-infinite",
-      "checker": "synthetic/deepseek-v4.1-flash-infinite"
     }
   }
 }

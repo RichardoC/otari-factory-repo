@@ -56,10 +56,10 @@ var (
 )
 
 // newTestVFS returns a vfs backed by an in-memory fake clientset.
-func newTestVFS(tb testing.TB) (*vfs, *fake.Clientset) {
+func newTestVFS(tb testing.TB, opts ...Option) (*vfs, *fake.Clientset) {
 	tb.Helper()
 	fcs := fake.NewSimpleClientset()
-	return NewVFS(tb.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3), fcs
+	return NewVFS(tb.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3, opts...), fcs
 }
 
 // openTestFile opens name through the VFS itself, as sqlite would, with
@@ -3728,5 +3728,32 @@ func TestDeleteNonexistentJournalSucceeds(t *testing.T) {
 	// common case is a journal name with nothing behind it.
 	if err := v.Delete("never.db-journal", false); err != nil {
 		t.Errorf("Delete of nonexistent journal = %v, want nil", err)
+	}
+}
+
+// TestNewVFSNonPositiveLockLeaseKeepsDefault pins the documented behaviour of
+// WithLockLease (README: "WithLockLease(0) (or any non-positive value) keeps
+// the default 30 s lease"): only a positive duration changes the lease, so a
+// non-positive option must leave NewVFS's defaultLockLease initialisation in
+// place instead of zeroing the lease or panicking. It reads v.lockLease
+// directly, which is why it lives in this package.
+func TestNewVFSNonPositiveLockLeaseKeepsDefault(t *testing.T) {
+	tests := []struct {
+		name string
+		opts []Option
+		want time.Duration
+	}{
+		{name: "no option", want: defaultLockLease},
+		{name: "zero", opts: []Option{WithLockLease(0)}, want: defaultLockLease},
+		{name: "negative", opts: []Option{WithLockLease(-5 * time.Second)}, want: defaultLockLease},
+		{name: "positive", opts: []Option{WithLockLease(10 * time.Second)}, want: 10 * time.Second},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			v, _ := newTestVFS(t, tc.opts...)
+			if got := v.lockLease; got != tc.want {
+				t.Errorf("lockLease = %s, want %s", got, tc.want)
+			}
+		})
 	}
 }

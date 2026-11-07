@@ -95,7 +95,8 @@ func newSearchProxy(t *testing.T, key string, stub *searchStub, searchesPerRun i
 	t.Helper()
 	return &proxy{
 		upstream:       stub.url(),
-		apiKey:         key,
+		apiKey:         key, // the Otari key; search must never see it
+		searchKey:      key,
 		ledger:         filepath.Join(t.TempDir(), "ledger.jsonl"),
 		searchURL:      stub.url(),
 		searchesPerRun: searchesPerRun,

@@ -147,7 +147,8 @@ whether through prompt injection or a compromised model.
   still checks the patch, and the state merge still re-checks the bundle.
   The launch line passes the agent user only `CODEAF_BASE_URL`,
   `CODEAF_HOME` and `PATH` (sudo's env_reset drops the rest), and the
-  synthetic.new key still reaches the proxy alone, on stdin.
+  proxy's keys (Otari for chat, the synthetic.new key for search) still
+  reach the proxy alone, on stdin.
 - The job that runs CodeAF (`run`) gets no write token and no secret other
   than the proxy's key on stdin. Anything that needs write access (commit,
   push, PR, comments, CI dispatch) happens in `publish`, on a fresh runner.
@@ -256,8 +257,10 @@ whether through prompt injection or a compromised model.
 ### Secrets, tokens and triggers
 
 - Never put a secret in the environment of the step that runs CodeAF, or
-  anywhere it can read it. The synthetic.new key goes only to the proxy, on
-  stdin. Keep `persist-credentials: false` on checkouts, and push with the
+  anywhere it can read it. The proxy's keys (the Otari key first, the
+  synthetic.new key second) go only to the proxy, on stdin; the Otari key is
+  sent only to the chat upstream and the synthetic.new key only to the
+  search endpoint. Keep `persist-credentials: false` on checkouts, and push with the
   token only after CodeAF has exited. The launch line gives the agent user
   only the environment listed under "Privilege separation"; sudo's
   env_reset strips everything else, and no secret is ever passed through it.

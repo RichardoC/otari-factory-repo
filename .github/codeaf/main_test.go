@@ -140,7 +140,7 @@ func TestRewriteRequest(t *testing.T) {
 		t.Fatalf("stream=%v err=%v", stream, err)
 	}
 	for key, want := range map[string]string{
-		"model":            `"hf:zai-org/GLM-5.3-Flash"`,
+		"model":            `"synthetic.new:hf:zai-org/GLM-5.3-Flash"`,
 		"reasoning_effort": `"medium"`,
 		"stream_options":   `{"include_usage":true}`,
 		"tools":            `[{"type":"function"}]`,
@@ -273,7 +273,7 @@ func TestProxyEndToEnd(t *testing.T) {
 	if response.StatusCode != 200 || !strings.Contains(body, `"cost":0.001824`) || !strings.Contains(body, "data: [DONE]") {
 		t.Fatalf("stream call: %d %s", response.StatusCode, body)
 	}
-	if seen[1]["model"] != "hf:zai-org/GLM-5.3" {
+	if seen[1]["model"] != "synthetic.new:hf:zai-org/GLM-5.3" {
 		t.Errorf("upstream saw model %v", seen[1]["model"])
 	}
 
@@ -408,7 +408,7 @@ func TestProxyLimitsCallsPerModel(t *testing.T) {
 		inFlight[body.Model]++
 		peak[body.Model] = max(peak[body.Model], inFlight[body.Model])
 		mu.Unlock()
-		if body.Model == "hf:zai-org/GLM-5.3-Flash" {
+		if body.Model == "synthetic.new:hf:zai-org/GLM-5.3-Flash" {
 			<-hold
 		}
 		mu.Lock()
@@ -453,7 +453,7 @@ func TestProxyLimitsCallsPerModel(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		mu.Lock()
-		n := inFlight["hf:zai-org/GLM-5.3-Flash"]
+		n := inFlight["synthetic.new:hf:zai-org/GLM-5.3-Flash"]
 		mu.Unlock()
 		if n == 2 || time.Now().After(deadline) {
 			break
@@ -465,7 +465,7 @@ func TestProxyLimitsCallsPerModel(t *testing.T) {
 	}
 	close(hold)
 	wg.Wait()
-	if got := peak["hf:zai-org/GLM-5.3-Flash"]; got != 2 {
+	if got := peak["synthetic.new:hf:zai-org/GLM-5.3-Flash"]; got != 2 {
 		t.Errorf("peak flash calls in flight upstream: %d, want 2", got)
 	}
 	// The three flash calls that queued behind the two held slots recorded
@@ -2640,7 +2640,7 @@ func TestProxyRepairsInvalidToolArgs(t *testing.T) {
 	if err := json.Unmarshal(upstreamBody, &seen); err != nil {
 		t.Fatal(err)
 	}
-	if string(seen["model"]) != `"hf:zai-org/GLM-5.3-Flash"` {
+	if string(seen["model"]) != `"synthetic.new:hf:zai-org/GLM-5.3-Flash"` {
 		t.Errorf("upstream saw model %s", seen["model"])
 	}
 	if string(seen["temperature"]) != "0.5" {
@@ -2734,170 +2734,6 @@ func TestReportRepairedToolArgs(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------- quotas
-
-// The /v2/quotas parse is defensive (issue #59): the units are undocumented,
-// so only the expected shape with both numbers present yields a known quota,
-// and nothing is allowed to panic or fail on an unfamiliar body.
-func TestParseQuotas(t *testing.T) {
-	q := parseQuotas([]byte(`{"subscription":{"limit":135,"requests":0,"renewsAt":"2026-10-24T00:00:00Z"}}`))
-	if !q.Known || q.Limit != 135 || q.Requests != 0 || q.RenewsAt != "2026-10-24T00:00:00Z" {
-		t.Fatalf("documented example: %+v", q)
-	}
-	// Unknown extra fields, top-level and inside subscription, do not break it.
-	q = parseQuotas([]byte(`{"plan":"big","source":"v2","subscription":{"limit":135,"requests":7,"renewsAt":"r","note":"x"}}`))
-	if !q.Known || q.Limit != 135 || q.Requests != 7 || q.RenewsAt != "r" {
-		t.Fatalf("extra fields: %+v", q)
-	}
-	for name, body := range map[string]string{
-		"strings instead of numbers": `{"subscription":{"limit":"135","requests":"0"}}`,
-		"missing subscription":       `{"subscription":null}`,
-		"empty object":               `{}`,
-		"missing limit":              `{"subscription":{"requests":0}}`,
-		"missing requests":           `{"subscription":{"limit":135}}`,
-		"zero limit":                 `{"subscription":{"limit":0,"requests":0}}`,
-		"negative limit":             `{"subscription":{"limit":-1,"requests":0}}`,
-		"negative requests":          `{"subscription":{"limit":135,"requests":-1}}`,
-		"wrong types":                `{"subscription":{"limit":{},"requests":[]}}`,
-		"out-of-range number":        `{"subscription":{"limit":1e999,"requests":0}}`,
-		"garbage body":               `<html>rate limited</html>`,
-		"empty body":                 ``,
-	} {
-		if got := parseQuotas([]byte(body)); got.Known {
-			t.Errorf("%s: parsed as known: %q", name, body)
-		}
-	}
-}
-
-// The quota endpoint lives at the API root, not under the chat base's
-// /openai/v1.
-func TestQuotasURL(t *testing.T) {
-	for upstream, want := range map[string]string{
-		"https://api.synthetic.new/openai/v1":  "https://api.synthetic.new/v2/quotas",
-		"https://api.synthetic.new/openai/v1/": "https://api.synthetic.new/v2/quotas",
-		"http://127.0.0.1:9999/openai/v1":      "http://127.0.0.1:9999/v2/quotas",
-	} {
-		if got := quotasURL(upstream); got != want {
-			t.Errorf("quotasURL(%q) = %q, want %q", upstream, got, want)
-		}
-	}
-}
-
-func TestFetchQuotas(t *testing.T) {
-	body := `{"subscription":{"limit":135,"requests":40,"renewsAt":"2026-10-24T00:00:00Z"}}`
-	auth := make(chan string, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		auth <- r.Header.Get("Authorization")
-		fmt.Fprint(w, body)
-	}))
-	defer server.Close()
-	q, raw, err := fetchQuotas(context.Background(), server.Client(), server.URL, "secret-key")
-	if err != nil || !q.Known || q.Limit != 135 || q.Requests != 40 || raw != body {
-		t.Fatalf("fetch = %+v, %q, %v", q, raw, err)
-	}
-	if got := <-auth; got != "Bearer secret-key" {
-		t.Errorf("Authorization = %q", got)
-	}
-	// A server error is an error, and the raw body still comes back for the
-	// diagnostics marker.
-	server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		fmt.Fprint(w, body)
-	})
-	if _, raw, err := fetchQuotas(context.Background(), server.Client(), server.URL, "k"); err == nil || raw != body {
-		t.Errorf("status 503: raw = %q, err = %v, want the body and an error", raw, err)
-	}
-	// A network failure leaves nothing to mark: quota unknown, no raw body.
-	server.Close()
-	if _, raw, err := fetchQuotas(context.Background(), server.Client(), server.URL, "k"); err == nil || raw != "" {
-		t.Errorf("network error: raw = %q, err = %v, want no body and an error", raw, err)
-	}
-}
-
-// The quotas marker carries the raw body, capped at 4KiB; a body truncated
-// by the cap no longer parses, which the report treats as no quota row.
-func TestRecordQuotasMarker(t *testing.T) {
-	ledger := filepath.Join(t.TempDir(), "l.jsonl")
-	p := &proxy{ledger: ledger}
-	small := `{"subscription":{"limit":135,"requests":0,"renewsAt":"r"}}`
-	huge := `{"note":"` + strings.Repeat("x", 6000) + `"}`
-	p.recordQuotas(small)
-	p.recordQuotas(huge)
-	lines, err := readLedger(ledger)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(lines) != 2 || lines[0].Kind != "quotas" || lines[0].Time.IsZero() || lines[1].Kind != "quotas" {
-		t.Fatalf("markers = %+v", lines)
-	}
-	if lines[0].Quotas != small || !parseQuotas([]byte(lines[0].Quotas)).Known {
-		t.Errorf("small marker = %q", lines[0].Quotas)
-	}
-	if len(lines[1].Quotas) > 4<<10 {
-		t.Errorf("huge marker not capped: %d bytes", len(lines[1].Quotas))
-	}
-	if parseQuotas([]byte(lines[1].Quotas)).Known {
-		t.Error("a body truncated by the cap parsed as known")
-	}
-	// Like every marker, it carries no tokens or cost.
-	if text, err := os.ReadFile(ledger); err != nil || strings.Contains(string(text), "cost") || strings.Contains(string(text), "tokens") {
-		t.Errorf("marker line = %s (%v)", text, err)
-	}
-}
-
-// A quota reported exhausted at startup refuses chat calls only while
-// overage is disabled; an unknown quota never blocks.
-func TestOverCapQuotaExhausted(t *testing.T) {
-	exhausted := quota{Known: true, Limit: 135, Requests: 135}
-	p := &proxy{runCap: 5, weekCap: 20, overageCap: 0, quota: exhausted}
-	want := "the subscription quota reports exhausted and overage is disabled"
-	if got := p.overCap(); !strings.Contains(got, want) {
-		t.Errorf("overCap = %q, want it to contain %q", got, want)
-	}
-	// With overage allowed the quota does not refuse by itself.
-	p.overageCap = 0.01
-	if got := p.overCap(); got != "" {
-		t.Errorf("overCap = %q, want \"\" with overage allowed", got)
-	}
-	// An unknown quota — fetch failed, unfamiliar shape — never blocks.
-	p.quota = quota{}
-	if got := p.overCap(); got != "" {
-		t.Errorf("overCap = %q, want \"\" for an unknown quota", got)
-	}
-	// Reported but not exhausted: no refusal.
-	p.quota = quota{Known: true, Limit: 135, Requests: 3}
-	if got := p.overCap(); got != "" {
-		t.Errorf("overCap = %q, want \"\" below the quota", got)
-	}
-}
-
-// The quota row: rendered from the ledger's quotas marker, omitted when the
-// marker is absent or its body does not parse.
-func TestReportQuotaRow(t *testing.T) {
-	result := Result{Stop: "done"}
-	cfg := Config{Limits: Limits{Plan: "big", WeeklyCreditUSD: 20, RunCreditUSD: 5, OverageUSD: 0}, Models: testModels(t)}
-	render := func(lines []LedgerLine) string {
-		return Report(result, true, lines, cfg, nil, ReportInputs{}, func(string) string { return "" })
-	}
-	with := render([]LedgerLine{
-		{Kind: "proxy_start", Time: time.Now().Add(-time.Hour)},
-		{Kind: "quotas", Time: time.Now(), Quotas: `{"subscription":{"limit":135,"requests":40,"renewsAt":"2026-10-24T00:00:00Z"}}`},
-	})
-	if want := "| synthetic.new quota | limit 135, used 40, renewsAt 2026-10-24T00:00:00Z (units undocumented) |"; !strings.Contains(with, want) {
-		t.Errorf("report lacks the quota row %q:\n%s", want, with)
-	}
-	// An unparseable marker body renders no row.
-	unparseable := render([]LedgerLine{{Kind: "quotas", Time: time.Now(), Quotas: `{"subscription":{"limit":"x"}}`}})
-	if strings.Contains(unparseable, "synthetic.new quota") {
-		t.Errorf("unparseable marker rendered a row:\n%s", unparseable)
-	}
-	// No marker at all: no row.
-	absent := render(nil)
-	if strings.Contains(absent, "synthetic.new quota") {
-		t.Errorf("no marker but a row rendered:\n%s", absent)
-	}
-}
-
 // The metered row's weekly and overage figures: WEEK_SPENT_BEFORE unknown
 // renders "?", and overage replays record()'s rule — calls written after the
 // week's credit was exhausted are the API-priced spend past the quota.
@@ -2937,71 +2773,6 @@ func TestReportWeekAndOverage(t *testing.T) {
 	report = Report(result, true, lines, cfg, nil, ReportInputs{}, func(k string) string { return env[k] })
 	if !strings.Contains(report, "? this week") {
 		t.Errorf("invalid WEEK_SPENT_BEFORE did not render \"?\":\n%s", report)
-	}
-}
-
-// The /v2/quotas body lands in public artifacts, so only its shape, numbers,
-// booleans and timestamps survive.
-func TestRedactQuotasBody(t *testing.T) {
-	raw := `{"subscription":{"limit":135,"requests":0,"renewsAt":"2025-09-21T14:36:14.288Z","email":"someone@example.com","active":true,"plans":["big"]}}`
-	got := redactQuotasBody(raw)
-	for _, want := range []string{`"limit":135`, `"requests":0`, `"renewsAt":"2025-09-21T14:36:14.288Z"`, `"active":true`, `"email":"[redacted]"`, `["[redacted]"]`} {
-		if !strings.Contains(got, want) {
-			t.Errorf("redacted body lacks %s: %s", want, got)
-		}
-	}
-	if strings.Contains(got, "someone@example.com") || strings.Contains(got, `"big"`) {
-		t.Errorf("a string survived redaction: %s", got)
-	}
-	if q := parseQuotas([]byte(got)); q != parseQuotas([]byte(raw)) {
-		t.Errorf("redaction changed the parsed quota: %+v vs %+v", q, parseQuotas([]byte(raw)))
-	}
-	if got := redactQuotasBody("<html>secret</html>"); got != "[non-JSON body, 19 bytes]" {
-		t.Errorf("non-JSON body: %q", got)
-	}
-}
-
-// Credit figures are strings in synthetic.new's body; numbers survive
-// redaction, anything else does not.
-func TestRedactQuotasBodyKeepsNumberStrings(t *testing.T) {
-	raw := `{"weeklyTokenLimit":{"maxCredits":"$120.50","remainingCredits":"117.29","percentRemaining":97.3,"note":"$1 off for you@example.com"}}`
-	got := redactQuotasBody(raw)
-	for _, want := range []string{`"maxCredits":"$120.50"`, `"remainingCredits":"117.29"`, `"percentRemaining":97.3`, `"note":"[redacted]"`} {
-		if !strings.Contains(got, want) {
-			t.Errorf("redacted body lacks %s: %s", want, got)
-		}
-	}
-}
-
-// The weekly credit synthetic.new reports is what runs out on the Big plan:
-// below the floor, with overage 0, the proxy refuses; above it, or with
-// overage allowed, or unknown, it never blocks.
-func TestOverCapWeeklyCreditPercent(t *testing.T) {
-	q := parseQuotas([]byte(`{"subscription":{"limit":500,"requests":0},"weeklyTokenLimit":{"percentRemaining":7.5,"maxCredits":"$20"}}`))
-	if !q.PercentKnown || q.PercentRemaining != 7.5 {
-		t.Fatalf("percentRemaining not parsed: %+v", q)
-	}
-	for _, bad := range []string{`{"weeklyTokenLimit":{"percentRemaining":"7"}}`, `{"weeklyTokenLimit":{"percentRemaining":150}}`, `{"weeklyTokenLimit":{"percentRemaining":-1}}`, `{}`} {
-		if q := parseQuotas([]byte(bad)); q.PercentKnown {
-			t.Errorf("%s parsed as known: %+v", bad, q)
-		}
-	}
-	p := &proxy{runCap: 5, weekCap: 22, minCreditPct: 10, quota: q}
-	if reason := p.overCap(); !strings.Contains(reason, "7.5%") {
-		t.Errorf("below the floor with overage 0: %q", reason)
-	}
-	p.overageCap = 1
-	if reason := p.overCap(); reason != "" {
-		t.Errorf("overage allowed must not refuse on the floor: %q", reason)
-	}
-	p.overageCap = 0
-	p.quota = quota{PercentRemaining: 50, PercentKnown: true}
-	if reason := p.overCap(); reason != "" {
-		t.Errorf("above the floor: %q", reason)
-	}
-	p.quota = quota{}
-	if reason := p.overCap(); reason != "" {
-		t.Errorf("unknown quota must never block: %q", reason)
 	}
 }
 
@@ -3463,14 +3234,16 @@ func TestProxyNoWaitStreamKeepsTheStatusCodes(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	newProxy := func() *proxy {
+	// A run cap of 0 refuses every call (runSpent >= runCap at once), which
+	// is what exercised the 402 path before the quota floor existed.
+	newProxy := func(runCap float64) *proxy {
 		return &proxy{upstream: upstream.URL, apiKey: "k", ledger: filepath.Join(t.TempDir(), "l.jsonl"),
-			runCap: 5, weekCap: 20, models: testModels(t), client: upstream.Client(),
-			overageCap: 0, quota: quota{Known: true, Limit: 10, Requests: 10}}
+			runCap: runCap, weekCap: 20, models: testModels(t), client: upstream.Client(),
+			overageCap: 0}
 	}
 
 	// The cap refusal: a real 402 with the JSON error shape, not a stream.
-	p := newProxy()
+	p := newProxy(0)
 	server := httptest.NewServer(p)
 	defer server.Close()
 	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
@@ -3491,8 +3264,7 @@ func TestProxyNoWaitStreamKeepsTheStatusCodes(t *testing.T) {
 	}
 
 	// The upstream 429 passes through with its own status and body.
-	p = newProxy()
-	p.quota = quota{} // let the call through to upstream
+	p = newProxy(5)
 	server2 := httptest.NewServer(p)
 	defer server2.Close()
 	response, err = http.Post(server2.URL+"/v1/chat/completions", "application/json",
@@ -4613,7 +4385,7 @@ func TestCapRefusalAfterASlotWaitIsRecorded(t *testing.T) {
 		inFlight[body.Model]++
 		held := inFlight[body.Model] == 1
 		mu.Unlock()
-		if body.Model == "hf:zai-org/GLM-5.3" && held {
+		if body.Model == "synthetic.new:hf:zai-org/GLM-5.3" && held {
 			<-hold
 		}
 		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"hi"}}],"model":"x","usage":{"prompt_tokens":1000,"completion_tokens":200}}`)
@@ -4647,7 +4419,7 @@ func TestCapRefusalAfterASlotWaitIsRecorded(t *testing.T) {
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		mu.Lock()
-		n := inFlight["hf:zai-org/GLM-5.3"]
+		n := inFlight["synthetic.new:hf:zai-org/GLM-5.3"]
 		mu.Unlock()
 		if n == 1 || time.Now().After(deadline) {
 			break
@@ -4655,7 +4427,7 @@ func TestCapRefusalAfterASlotWaitIsRecorded(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	mu.Lock()
-	held := inFlight["hf:zai-org/GLM-5.3"] >= 1
+	held := inFlight["synthetic.new:hf:zai-org/GLM-5.3"] >= 1
 	mu.Unlock()
 	if !held {
 		t.Fatal("the holding call never reached upstream")

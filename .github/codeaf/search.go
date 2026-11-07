@@ -130,10 +130,13 @@ func (p *proxy) search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	upstream.Header.Set("Content-Type", "application/json")
-	// THE key flow: the only place p.apiKey is ever written. Logs below
-	// carry the query's length, the result count and the status — no key,
-	// no query text.
-	upstream.Header.Set("Authorization", "Bearer "+p.apiKey)
+	// THE key flow: the only place p.searchKey is ever written. Search
+	// stays on synthetic.new for now (chat goes through hosted Otari), so
+	// this endpoint gets the synthetic.new key and never the Otari one; the
+	// Otari key never leaves the chat upstream. Logs below carry the
+	// query's length, the result count and the status — no key, no query
+	// text.
+	upstream.Header.Set("Authorization", "Bearer "+p.searchKey)
 	response, err := searchClient.Do(upstream)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "search: upstream unreachable")

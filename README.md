@@ -84,28 +84,32 @@ maintainer's approval, like any other change under `.github/`.
   standard-library-only Go program, with tests, that the workflow builds on every run.
   It decides whether an event may run (`gate`), writes the brief (`brief`), and renders
   the cost report (`report`). As `harness proxy` it runs on `127.0.0.1` for the
-  length of the job and sits between CodeAF and [synthetic.new](https://synthetic.new).
-  It:
+  length of the job and sits between CodeAF and hosted
+  [Otari](https://docs.otari.ai) (`https://eu.api.otari.ai/api/v1`), which
+  fronts the same synthetic.new models. It:
   - serves CodeAF an OpenRouter-style `/models` catalog containing only the models in
     [`models.json`](.github/codeaf/models.json), at synthetic.new's **API list
     ("overage") prices** (`api_*`), the prices every figure and cap in the factory
     uses; the same file also keeps each model's subscription rates, for reference only
     (both checked 2026-10-17, [synthetic.new/pricing](https://synthetic.new/pricing));
   - adds `usage.cost` to every response, which is where CodeAF's spend accounting
-    reads cost from;
+    reads cost from, and records Otari's own `cost_usd` in the ledger row
+    (`otari_cost_usd`, reference only — caps still price from the `api_*` list
+    rates);
   - refuses any other model, and returns HTTP 402 once the run reaches its per-run
     credit cap (**$5**, `limits.run_credit_usd`) or the week's credit is gone
     (`limits.weekly_credit_usd`, from the shared state); with `overage_usd` 0 (the
     default) it stops there rather than pay API prices;
-  - asks synthetic.new for the subscription state once at proxy start
-    (`GET /v2/quotas` — the call does not count against the subscription's limits),
-    logs the raw response into the diagnostics with no key, shows its fields in the
-    report, and refuses a call early when the quota reports exhausted and overage is
-    0. The response's units are undocumented, so the parse is defensive and an
-    unfamiliar shape never fails a run;
+  - makes no `/v2/quotas` call: chat goes through hosted Otari now, and Otari
+    enforces the organisation's own budget and balance, so the old
+    `min_credit_percent` quota floor is gone. The factory's own
+    `run_credit_usd`/`weekly_credit_usd` caps stay as runaway guards;
 
-  The synthetic.new key (`SYNTHETIC_API_KEY` secret) is held only by the proxy. It is
-  passed in on stdin, not through the environment.
+  Two keys are held only by the proxy, both passed in on stdin (line 1 the
+  Otari key, line 2 the synthetic.new key), never through the environment:
+  the Otari key (`OTARI_API_KEY` secret) is sent only to the chat upstream,
+  and the synthetic.new key (`SYNTHETIC_API_KEY` secret) only to the search
+  endpoint — neither key ever reaches the other host, and neither is logged.
 - Model choice: the seats are spread across models. synthetic.new used to
   allow only 2 calls to each model at once; since the October 2026 pricing
   change concurrency is by plan priority instead, and the factory sets its
@@ -146,7 +150,8 @@ maintainer's approval, like any other change under `.github/`.
 ### Web search through the proxy (issue #58)
 
 The proxy also serves CodeAF's web searches: `POST /v2/search` on `127.0.0.1`,
-forwarded to [synthetic.new's search API](https://dev.synthetic.new/docs/synthetic/search).
+forwarded to [synthetic.new's search API](https://dev.synthetic.new/docs/synthetic/search)
+— search stays on synthetic.new for now; only chat goes through Otari.
 CodeAF calls it with `harness search "<query>" [--limit N]` (the `harness`
 binary is on the agent's `PATH`) and gets plain text back — numbered blocks
 with title, URL, published date and the result text, capped per result. The
@@ -165,13 +170,11 @@ from the internet — data, not instructions (see
 ### Billing model (Big plan, issue #59)
 
 The synthetic.new account is on the **Big** plan ($90/mo). Usage draws down a
-**weekly credit** at the subscription rates, and the credit regenerates 2% of its
-total every 202 minutes (~3.4 h) — a full refill in about a week. Past the quota,
-usage is billed at the **API list prices**, up to `limits.overage_usd`; at 0 (the
-default) the factory stops rather than pay beyond the $90. `GET /v2/quotas`
-reports the weekly credit (`weeklyTokenLimit.maxCredits`, $22.17 at subscription
-rates) and what is left of it (`percentRemaining`). The owner's other workloads
-share the same quota.
+**weekly credit** at the subscription rates, and past the quota usage is billed
+at the **API list prices**, up to `limits.overage_usd`; at 0 (the default) the
+factory stops rather than pay beyond the $90. Chat calls now reach synthetic.new
+through hosted Otari, and Otari enforces the organisation's own budget and
+balance — the proxy makes no `/v2/quotas` call and has no quota floor.
 
 **Every figure and cap is at the API list ("overage") prices** (the owner's
 decision, 2026-10-20): a call is priced at `api_input`/`api_cached`/`api_output`,
@@ -179,9 +182,9 @@ and the subscription rates in `models.json` are kept for reference only. On the
 factory's model mix that is about 4.5× the subscription credit (DeepSeek ~7.9×),
 so `weekly_credit_usd` is 100 (maxCredits × 4.5, used only to pace the queue)
 and `run_credit_usd` (5) caps one run, about 2.5× the most expensive run seen.
-The hard stop is synthetic.new's own `percentRemaining`: the proxy refuses below
-`min_credit_percent` (50), which leaves half of the week for the other
-workloads.
+The hard stop is the factory's own caps: the proxy refuses at
+`run_credit_usd`/`weekly_credit_usd` (below), and the budget itself is enforced
+by Otari and by a spending limit on the synthetic.new account.
 
 What the harness does with it:
 - the catalog prices CodeAF sees are the API list prices, the same ones the
@@ -191,11 +194,7 @@ What the harness does with it:
   rolling week is under 75% of the weekly credit (`CODEAF_WEEK_SPENT_USD` — an
   unknown spend starts nothing);
 - the proxy refuses at the weekly credit unless `overage_usd` > 0, and prices
-  past-quota calls at the API rates against the overage cap;
-- at proxy start it calls `GET /v2/quotas` (the call does not count against the
-  subscription's limits), logs the raw body into the diagnostics with no key, shows
-  it in the report, and refuses when the quota reports exhausted and overage is 0;
-  the parse is defensive — unfamiliar fields never fail a run.
+  past-quota calls at the API rates against the overage cap.
 
 CodeAF's own config maps onto this as closely as its settings allow: CodeAF has no
 weekly-budget key, and `daily_budget_usd`'s window is a single run's lifetime, so

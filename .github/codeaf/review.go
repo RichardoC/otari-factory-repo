@@ -522,7 +522,16 @@ func diffPaths(diff string) map[string]bool {
 	if strings.TrimSpace(diff) == "" {
 		return nil
 	}
-	diffs, _ := diffstat([]byte(diff))
+	diffs, more := diffstat([]byte(diff))
+	if more > 0 {
+		// diffstat parsed only the first maxDiffFiles files and counted the
+		// rest; the set in hand is partial, and a fenced finding on any file
+		// past the cap would be read as a quote about a path the diff does
+		// not touch and dropped. A capped listing is no listing: report the
+		// paths as unknown, which keeps every finding — the same safe
+		// direction as a diff that is missing or unparseable.
+		return nil
+	}
 	if len(diffs) == 0 {
 		return nil
 	}
@@ -542,6 +551,23 @@ func diffPaths(diff string) map[string]bool {
 // shape every inline finding opens with. The word is short and holds no
 // spaces or brackets, so a markdown link, a footnote or a task list cannot
 // pass for one.
+// knownPaths is the known set review-report hands the findings parser: the
+// paths the diff touches, or nil when the diff is missing, unparseable or
+// incomplete. A diff stopped at diffReadCap (issue #458) names only the
+// files before the cut, and diffstat at maxDiffFiles (this issue) only the
+// files before the cap, so a set built from either would read a real fenced
+// finding past the cut as a quote about a path the diff does not touch and
+// drop it — the false pass the path filter exists to prevent. An incomplete
+// diff is therefore no diff: the parser gets nil and keeps every finding,
+// the same safe direction as a fetch that failed.
+func knownPaths(diff string, truncated bool, pr int) map[string]bool {
+	if truncated {
+		fmt.Fprintf(os.Stderr, "review-report: the diff of %d stopped at %d bytes; findings are parsed without it\n", pr, diffReadCap)
+		return nil
+	}
+	return diffPaths(diff)
+}
+
 var inlineSeverityToken = regexp.MustCompile(`\[[A-Za-z0-9_-]{1,24}\]`)
 
 // locationShaped matches text that opens like a path:line location. A token
@@ -1616,18 +1642,11 @@ func runReviewReport() error {
 	// reviewer quoted, not a place to fix. The diff fetch is best-effort —
 	// this command already reports a review without one, so a failed or
 	// unreadable fetch parses every finding, as it did before the issue.
-	known := map[string]bool(nil)
+	var known map[string]bool
 	if diff, truncated, err := newGitHub().diff(pr); err != nil {
 		fmt.Fprintf(os.Stderr, "review-report: reading the diff of %d: %v; findings are parsed without it\n", pr, err)
-	} else if truncated {
-		// Issue #458 review finding: a diff cut at diffReadCap names only
-		// the files before the cut, so judging findings against it would
-		// drop a real fenced finding on any file past the cut as a quote.
-		// An incomplete diff is no diff here: parse every finding, which is
-		// the same safe direction as a fetch that failed.
-		fmt.Fprintf(os.Stderr, "review-report: the diff of %d stopped at %d bytes; findings are parsed without it\n", pr, diffReadCap)
 	} else {
-		known = diffPaths(diff)
+		known = knownPaths(diff, truncated, pr)
 	}
 	findings, sawSection := parseFindingsIn(effectiveAnswer(result, c), known)
 	if len(findings) == 0 {

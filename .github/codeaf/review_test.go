@@ -2632,6 +2632,86 @@ func TestParseFindingsFencedOutsideDiffIsAQuote(t *testing.T) {
 	}
 }
 
+// TestParseFindingsFencedCappedDiffstatKeepsFinding (issue #37): diffstat
+// parses at most maxDiffFiles files and counts the rest, but diffPaths
+// discarded the count and presented the partial set as complete — a fenced
+// finding on the 201st path was read as a quote about a path the diff does
+// not touch and dropped, the false pass the path filter exists to prevent.
+// A capped listing is now no listing: the known set is nil and the finding
+// is kept and blocks.
+func TestParseFindingsFencedCappedDiffstatKeepsFinding(t *testing.T) {
+	last := maxDiffFiles + 1
+	var b strings.Builder
+	for i := 1; i <= last; i++ {
+		b.WriteString(diffFile(fmt.Sprintf("app/dir%d/file%d.go", i, i), 2))
+	}
+	diff := b.String()
+	if known := diffPaths(diff); known != nil {
+		t.Errorf("a %d-file diff built a partial known set of %d paths, want nil", last, len(known))
+	}
+	// Paths unknown, the fenced bullet past the cap is a real report: kept,
+	// and it starts the normal blocking path.
+	bullet := fmt.Sprintf("```\n- [high] app/dir%d/file%d.go:7 - the lock is held across the send\n```\n", last, last)
+	if f, _ := parseFindingsIn(bullet, diffPaths(diff)); len(f) != 1 {
+		t.Errorf("a fenced finding past the file cap = %+v, want it kept", f)
+	} else if len(blockingFindings(f)) != 1 {
+		t.Errorf("a fenced finding past the file cap stopped blocking: %+v", f)
+	}
+	// At the cap exactly — maxDiffFiles files, none past it — the set is
+	// complete, and a finding on the last parsed path blocks as usual.
+	var c strings.Builder
+	for i := 1; i <= maxDiffFiles; i++ {
+		c.WriteString(diffFile(fmt.Sprintf("app/dir%d/file%d.go", i, i), 2))
+	}
+	known := diffPaths(c.String())
+	if known == nil {
+		t.Fatal("a diff at the file cap yielded no known set")
+	}
+	path200 := fmt.Sprintf("app/dir%d/file%d.go", maxDiffFiles, maxDiffFiles)
+	if !known[path200] {
+		t.Errorf("the known set is missing the %dth path %q", maxDiffFiles, path200)
+	}
+	bullet200 := fmt.Sprintf("```\n- [high] %s:7 - the lock is held across the send\n```\n", path200)
+	if f, _ := parseFindingsIn(bullet200, known); len(f) != 1 || len(blockingFindings(f)) != 1 {
+		t.Errorf("a fenced finding on the %dth path = %+v, want it kept and blocking", maxDiffFiles, f)
+	}
+}
+
+// TestKnownPathsTruncatedDiffKeepsFinding (issue #37): a diff body stopped
+// at diffReadCap (1 MiB) names only the files before the cut, so
+// review-report must hand the parser nil — the same paths-unknown direction
+// as a fetch that failed — and a real fenced finding on a file past the cut
+// is kept. A complete diff still yields its paths, so the filter stays
+// armed for the quotes it exists to catch.
+func TestKnownPathsTruncatedDiffKeepsFinding(t *testing.T) {
+	body := strings.Repeat("diff --git a/app/x.go b/app/x.go\n+++ b/app/x.go\n@@\n", 30000)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, body)
+	}))
+	defer server.Close()
+	ghEnv(t, server)
+	diff, truncated, err := newGitHub().diff(37)
+	if err != nil {
+		t.Fatalf("diff: %v", err)
+	}
+	if !truncated {
+		t.Fatal("a body over diffReadCap did not report the truncation")
+	}
+	if known := knownPaths(diff, truncated, 37); known != nil {
+		t.Errorf("a truncated diff built a known set of %d paths, want nil", len(known))
+	}
+	bullet := "```\n- [high] app/past/the/cut.go:7 - the lock is held across the send\n```\n"
+	if f, _ := parseFindingsIn(bullet, nil); len(f) != 1 || len(blockingFindings(f)) != 1 {
+		t.Errorf("a fenced finding past the cut = %+v, want it kept and blocking", f)
+	}
+	complete := "diff --git a/app/queue/main.go b/app/queue/main.go\n" +
+		"--- a/app/queue/main.go\n+++ b/app/queue/main.go\n" +
+		"@@ -1,0 +1,1 @@\n+package main\n"
+	if known := knownPaths(complete, false, 37); known == nil || !known["app/queue/main.go"] {
+		t.Errorf("an untruncated diff lost its known set: %v", known)
+	}
+}
+
 // TestParseFindingsFenceGuardDoesNotDropUnfenced: the whole fence machinery
 // is inert outside a fence (issue #224). Every bullet the paraphrase guard
 // and the diff filter would drop when fenced is kept when unfenced — the

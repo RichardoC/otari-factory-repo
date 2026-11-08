@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -4056,5 +4057,70 @@ func TestRunDefersTicketWhoseFindingHasNoTargetID(t *testing.T) {
 	}
 	if result.Err() != nil {
 		t.Fatalf("Err() = %v, want nil", result.Err())
+	}
+}
+
+// TestRunCacheLogLine checks the "loaded sync cache" log: it reports the
+// cache's age (unknown when the cache carries no usable saved_at) and it is
+// logged only when the cache is actually used, not when a schema mismatch
+// makes the run ignore it.
+func TestRunCacheLogLine(t *testing.T) {
+	// A non-empty snapshot keeps the run short (nothing to create or
+	// resolve) while still exercising the cache-load path.
+	findings := model.SnykDASTSnapshot{
+		Findings: []model.Finding{{SnykDASTFindingID: "finding-1", TargetID: "target-a", TargetName: "project-a", IssueTitle: "finding on project-a", Severity: "high"}},
+	}
+	tests := []struct {
+		name          string
+		snapshot      cache.Snapshot
+		wantSubstring string
+		wantAbsent    string
+	}{
+		{
+			name: "fresh cache logs a duration",
+			snapshot: cache.Snapshot{
+				SchemaSignature: managedSchemaSignature(),
+				SavedAt:         time.Now().UTC().Add(-5 * time.Minute),
+			},
+			wantSubstring: "loaded sync cache",
+			wantAbsent:    "cache_age=unknown",
+		},
+		{
+			name: "cache without saved_at logs unknown age",
+			snapshot: cache.Snapshot{
+				SchemaSignature: managedSchemaSignature(),
+			},
+			wantSubstring: "cache_age=unknown",
+		},
+		{
+			name: "schema mismatch skips the loaded-cache log",
+			snapshot: cache.Snapshot{
+				SchemaSignature: "old-signature",
+				SavedAt:         time.Now().UTC().Add(-5 * time.Minute),
+			},
+			wantAbsent: "loaded sync cache",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var log bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&log, nil))
+			snykdast := fakeSnykDAST{snapshot: findings}
+			linear := &fakeLinear{}
+			cacheStore := &fakeCache{snapshot: tt.snapshot}
+
+			service := New(minimalCfg(), logger, snykdast, linear, cacheStore)
+			if _, err := service.Run(context.Background()); err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+
+			logged := log.String()
+			if tt.wantSubstring != "" && !strings.Contains(logged, tt.wantSubstring) {
+				t.Fatalf("log missing %q:\n%s", tt.wantSubstring, logged)
+			}
+			if tt.wantAbsent != "" && strings.Contains(logged, tt.wantAbsent) {
+				t.Fatalf("log must not contain %q:\n%s", tt.wantAbsent, logged)
+			}
+		})
 	}
 }

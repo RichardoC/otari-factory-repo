@@ -156,7 +156,6 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		if err != nil {
 			return RunResult{}, err
 		}
-		s.logger.Info("loaded sync cache", slog.Time("saved_at", loaded.SavedAt))
 		if loaded.SchemaSignature != "" && loaded.SchemaSignature != cacheSignature {
 			cacheEnabled = false
 			s.logger.Info("ignoring sync cache because managed schema changed",
@@ -165,6 +164,19 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			)
 		} else {
 			cacheSnapshot = loaded
+			// The cache is in use for this run, so report its freshness.
+			// SavedAt is zero when the cache predates save times or its
+			// saved_at row was corrupt; report the age as unknown then
+			// rather than a misleading epoch-zero timestamp.
+			cacheAge := "unknown"
+			if !loaded.SavedAt.IsZero() {
+				cacheAge = time.Since(loaded.SavedAt).Round(time.Second).String()
+			}
+			s.logger.Info("loaded sync cache",
+				slog.String("cache_age", cacheAge),
+				slog.Int("snyk_dast_rows", len(loaded.SnykDASTHashes)),
+				slog.Int("linear_rows", len(loaded.LinearHashes)),
+			)
 		}
 	}
 

@@ -70,7 +70,7 @@ func (s *Store) Load(ctx context.Context) (Snapshot, error) {
 		Where(sq.Eq{"key": []string{"schema_signature", "saved_at"}}).
 		ToSql()
 	if err != nil {
-		return Snapshot{}, fmt.Errorf("build cache schema signature query: %w", err)
+		return Snapshot{}, fmt.Errorf("build cache metadata query: %w", err)
 	}
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -87,11 +87,13 @@ func (s *Store) Load(ctx context.Context) (Snapshot, error) {
 		case "schema_signature":
 			snapshot.SchemaSignature = value
 		case "saved_at":
-			savedAt, err := time.Parse(time.RFC3339Nano, value)
-			if err != nil {
-				return Snapshot{}, fmt.Errorf("parse cache saved_at timestamp: %w", err)
+			// A malformed saved_at only means the age is unknown; it must
+			// not stop the cache from being used. The cache is only an
+			// optimisation: a corrupt row must never fail the whole sync,
+			// and it heals the next time Save runs.
+			if savedAt, ok := parseTimestamp(value); ok {
+				snapshot.SavedAt = savedAt
 			}
-			snapshot.SavedAt = savedAt
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -149,6 +151,25 @@ func (s *Store) Load(ctx context.Context) (Snapshot, error) {
 	}
 
 	return snapshot, nil
+}
+
+// parseTimestamp parses a sync_meta timestamp value. Values are written as
+// RFC3339Nano, but rows written by earlier versions or external tooling may
+// carry plain RFC3339 or SQLite's CURRENT_TIMESTAMP format instead, so all
+// three are accepted and the result is normalised to UTC. An empty value means
+// genuinely absent and yields a zero time with ok=true. A non-empty value in
+// none of these formats yields ok=false so the caller can treat the age as
+// unknown rather than failing the load.
+func parseTimestamp(raw string) (time.Time, bool) {
+	if raw == "" {
+		return time.Time{}, true
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05"} {
+		if ts, err := time.Parse(layout, raw); err == nil {
+			return ts.UTC(), true
+		}
+	}
+	return time.Time{}, false
 }
 
 func (s *Store) Save(ctx context.Context, snapshot Snapshot) error {

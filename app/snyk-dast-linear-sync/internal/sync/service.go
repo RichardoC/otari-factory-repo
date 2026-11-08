@@ -164,6 +164,19 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			)
 		} else {
 			cacheSnapshot = loaded
+			// The cache is in use for this run, so report its freshness.
+			// SavedAt is zero when the cache predates save times or its
+			// saved_at row was corrupt; report the age as unknown then
+			// rather than a misleading epoch-zero timestamp.
+			cacheAge := "unknown"
+			if !loaded.SavedAt.IsZero() {
+				cacheAge = time.Since(loaded.SavedAt).Round(time.Second).String()
+			}
+			s.logger.Info("loaded sync cache",
+				slog.String("cache_age", cacheAge),
+				slog.Int("snyk_dast_rows", len(loaded.SnykDASTHashes)),
+				slog.Int("linear_rows", len(loaded.LinearHashes)),
+			)
 		}
 	}
 
@@ -536,6 +549,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			}
 		}
 		nextSnapshot := cache.Snapshot{
+			SavedAt:         time.Now().UTC(),
 			SchemaSignature: cacheSignature,
 			SnykDASTHashes:  snykdastHashes,
 			LinearHashes:    cacheLinearHashes,
@@ -544,6 +558,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			return result, err
 		}
 		s.logger.Info("refreshed sync cache",
+			slog.Time("saved_at", nextSnapshot.SavedAt),
 			slog.Int("snyk_dast_rows", len(nextSnapshot.SnykDASTHashes)),
 			slog.Int("linear_rows", len(nextSnapshot.LinearHashes)),
 			slog.Int("uncached_failed", uncachedFailedCount),

@@ -505,6 +505,9 @@ avoid daily cache churn.
 
 The cache lives in SQLite and stores:
 
+- the UTC time the snapshot was saved, reported as the `cache_age` in the
+  "loaded sync cache" log line; a missing or malformed `saved_at` row leaves
+  the age unknown and the run proceeds with the cache
 - a schema signature for the managed issue format
 - a normalized hash for each Snyk DAST finding
 - a normalized hash for each managed Linear issue

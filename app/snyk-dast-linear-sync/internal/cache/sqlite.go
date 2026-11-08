@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	sq "github.com/Masterminds/squirrel"
 	_ "modernc.org/sqlite"
@@ -13,9 +14,11 @@ import (
 
 const schemaVersion = "v1"
 
-// Snapshot is the persisted sync state: a schema signature plus the
-// normalized hash of each Snyk DAST finding and each managed Linear issue.
+// Snapshot is the persisted sync state: its save time, schema signature and
+// the normalized hash of each Snyk DAST finding and each managed Linear issue.
+// SavedAt is zero when loading a cache written before save times were recorded.
 type Snapshot struct {
+	SavedAt         time.Time
 	SchemaSignature string
 	SnykDASTHashes  map[string]string
 	LinearHashes    map[string]string
@@ -62,12 +65,12 @@ func (s *Store) Load(ctx context.Context) (Snapshot, error) {
 	}
 
 	query, args, err := s.builder.
-		Select("value").
+		Select("key", "value").
 		From("sync_meta").
-		Where(sq.Eq{"key": "schema_signature"}).
+		Where(sq.Eq{"key": []string{"schema_signature", "saved_at"}}).
 		ToSql()
 	if err != nil {
-		return Snapshot{}, fmt.Errorf("build cache schema signature query: %w", err)
+		return Snapshot{}, fmt.Errorf("build cache metadata query: %w", err)
 	}
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -76,8 +79,21 @@ func (s *Store) Load(ctx context.Context) (Snapshot, error) {
 	}
 	defer rows.Close()
 	for rows.Next() {
-		if err := rows.Scan(&snapshot.SchemaSignature); err != nil {
-			return Snapshot{}, fmt.Errorf("scan cache schema signature: %w", err)
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			return Snapshot{}, fmt.Errorf("scan cache metadata: %w", err)
+		}
+		switch key {
+		case "schema_signature":
+			snapshot.SchemaSignature = value
+		case "saved_at":
+			// A malformed saved_at only means the age is unknown; it must
+			// not stop the cache from being used. The cache is only an
+			// optimisation: a corrupt row must never fail the whole sync,
+			// and it heals the next time Save runs.
+			if savedAt, ok := parseTimestamp(value); ok {
+				snapshot.SavedAt = savedAt
+			}
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -137,6 +153,25 @@ func (s *Store) Load(ctx context.Context) (Snapshot, error) {
 	return snapshot, nil
 }
 
+// parseTimestamp parses a sync_meta timestamp value. Values are written as
+// RFC3339Nano, but rows written by earlier versions or external tooling may
+// carry plain RFC3339 or SQLite's CURRENT_TIMESTAMP format instead, so all
+// three are accepted and the result is normalised to UTC. An empty value means
+// genuinely absent and yields a zero time with ok=true. A non-empty value in
+// none of these formats yields ok=false so the caller can treat the age as
+// unknown rather than failing the load.
+func parseTimestamp(raw string) (time.Time, bool) {
+	if raw == "" {
+		return time.Time{}, true
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05"} {
+		if ts, err := time.Parse(layout, raw); err == nil {
+			return ts.UTC(), true
+		}
+	}
+	return time.Time{}, false
+}
+
 func (s *Store) Save(ctx context.Context, snapshot Snapshot) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -148,7 +183,25 @@ func (s *Store) Save(ctx context.Context, snapshot Snapshot) error {
 		}
 	}()
 
+	savedAt := snapshot.SavedAt
+	if savedAt.IsZero() {
+		savedAt = time.Now().UTC()
+	}
+
 	query, args, err := s.builder.
+		Insert("sync_meta").
+		Columns("key", "value").
+		Values("saved_at", savedAt.UTC().Format(time.RFC3339Nano)).
+		Suffix("ON CONFLICT(key) DO UPDATE SET value = excluded.value").
+		ToSql()
+	if err != nil {
+		return fmt.Errorf("build cache saved_at upsert: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, query, args...); err != nil {
+		return fmt.Errorf("save cache saved_at timestamp: %w", err)
+	}
+
+	query, args, err = s.builder.
 		Insert("sync_meta").
 		Columns("key", "value").
 		Values("schema_signature", snapshot.SchemaSignature).

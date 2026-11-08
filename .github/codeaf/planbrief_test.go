@@ -471,6 +471,65 @@ func TestRunPlanBriefRepoFiles(t *testing.T) {
 	}
 }
 
+// TestRunPlanBriefWholeCapProtectsReportsAndOutput fills every source window
+// and both root files. The aggregate exceeds maxBriefBytes, but the cap must
+// spend it on lower-priority context rather than cutting off the reports or
+// the machine-parsed output contract.
+func TestRunPlanBriefWholeCapProtectsReportsAndOutput(t *testing.T) {
+	open := make([]string, maxPlanOpenIssues)
+	for i := range open {
+		open[i] = fmt.Sprintf(`{"number":%d,"title":%q,"body":%q}`, i+1, strings.Repeat("t", 200), strings.Repeat("o", maxPlanIssueBody))
+	}
+	closed := make([]string, maxPlanClosedIssues)
+	for i := range closed {
+		closed[i] = fmt.Sprintf(`{"number":%d,"title":%q,"body":%q}`, i+100, strings.Repeat("t", 200), strings.Repeat("c", maxPlanClosedBody))
+	}
+	pulls := make([]string, 20)
+	for i := range pulls {
+		pulls[i] = fmt.Sprintf(`{"number":%d,"title":%q}`, i+200, strings.Repeat("p", 200))
+	}
+	reports := make([]string, maxPlanRunReports)
+	for i := range reports {
+		reports[i] = fmt.Sprintf(`{"id":%d,"created_at":"2026-10-17T10:00:00Z","body":%q,"user":{"login":"github-actions[bot]"},"issue_url":"https://api.github.com/repos/RichardoC/factory-repo/issues/%d"}`, i+1, reportMarker+"\n"+strings.Repeat("r", maxPlanReportBody), i+1)
+	}
+	routes := map[string]string{
+		"/repos/RichardoC/factory-repo/issues?state=open&per_page=100":                              "[" + strings.Join(open, ",") + "]",
+		"/repos/RichardoC/factory-repo/issues?state=closed&sort=updated&direction=desc&per_page=20": "[" + strings.Join(closed, ",") + "]",
+		"/repos/RichardoC/factory-repo/pulls?state=closed&sort=updated&direction=desc&per_page=20":  "[" + strings.Join(pulls, ",") + "]",
+		"/repos/RichardoC/factory-repo/issues/comments?sort=created&direction=desc&per_page=100":    "[" + strings.Join(reports, ",") + "]",
+	}
+	dir := t.TempDir()
+	for _, name := range []string{"README.md", "AGENTS.md"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(strings.Repeat("x", maxPlanReadmeBytes*2)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	briefPath := planBriefEnv(t, planServer(t, routes, nil))
+	t.Chdir(dir)
+	if err := runPlanBrief(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief := string(data)
+	if len(brief) > maxBriefBytes {
+		t.Fatalf("brief length = %d, want at most %d", len(brief), maxBriefBytes)
+	}
+	for _, want := range []string{
+		"## Recent CodeAF run reports",
+		"### Run report on issue #3",
+		"# Output contract",
+		"### Proposal: <one-line title>",
+		"sections truncated or dropped: ## Recently closed issues",
+	} {
+		if !strings.Contains(brief, want) {
+			t.Errorf("maximal brief missing %q", want)
+		}
+	}
+}
+
 func TestRunPlanBriefRequiresEnv(t *testing.T) {
 	planHarnessDir(t)
 	t.Setenv("BRIEF_PATH", "")

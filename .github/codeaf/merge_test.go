@@ -606,6 +606,45 @@ func TestRunMergeDegradesUnusableConflictPathToNoMerge(t *testing.T) {
 	}
 }
 
+// Issue #34 security review: mergeTree unquotes git's C-quoted output, so a
+// conflicted path can carry a raw control byte -- a file named
+// "x\r::warning::forged" comes back with a raw CR, and a lone CR breaks a
+// log line: the runner treats it as a line break, so the rest of the name
+// would run as a workflow command. usableMergePath rejects every byte below
+// 0x20 and 0x7f, and runMerge applies the same check before committing, so
+// the merge degrades to no merge, with a recorded reason, instead of
+// writing a merge-info.json publish would refuse on every rerun.
+func TestRunMergeDegradesCRConflictPathToNoMerge(t *testing.T) {
+	r := newTestRepo(t)
+	name := "x\r::warning::forged"
+	base := r.commit("base", map[string]string{name: "a\nb\nc\n"})
+	pr := r.commit("pr change", map[string]string{name: "a\npr\nc\n"}, base)
+	mainTip := r.commit("main change", map[string]string{name: "a\nbase\nc\n"}, base)
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	r.withOrigin("pr", "main")
+	baseFile, infoFile, _ := artifactDir(t)
+
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != "none" {
+		t.Fatalf("runMerge: state=%q err=%v; want none", got.State, err)
+	}
+	if r.head() != pr {
+		t.Fatal("the branch moved without a merge")
+	}
+	if _, err := os.Stat(infoFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("merge info written for a merge that was not made: %v", err)
+	}
+	runState, err := os.ReadFile(runStateFile(infoFile))
+	if err != nil {
+		t.Fatalf("no no-merge record: %v", err)
+	}
+	if !strings.Contains(string(runState), "state=none") || !strings.Contains(string(runState), "cannot name") {
+		t.Fatalf("no-merge reason = %q; want the unusable-path refusal", runState)
+	}
+}
+
 // Issue #33: the 64 KB probe must size the recorded Workflows value the way
 // the write will, and the recorded value is only settled after
 // checkMergeGated -- so the probe sizes the longer literal (false, one byte
@@ -740,19 +779,16 @@ func TestRunMergeReasonKeepsInstructionUnderLongBaseRef(t *testing.T) {
 func TestRunMergeNoticeListStripsControlAndCapsOnRuneBoundary(t *testing.T) {
 	r := newTestRepo(t)
 	baseFiles := map[string]string{
-		"ctl\x01x.txt":                     "a\nb\nc\n",
 		strings.Repeat("é", 100) + "1.txt": "a\nb\nc\n",
 		strings.Repeat("é", 100) + "2.txt": "a\nb\nc\n",
 		strings.Repeat("é", 100) + "3.txt": "a\nb\nc\n",
 	}
 	prFiles := map[string]string{
-		"ctl\x01x.txt":                     "a\npr\nc\n",
 		strings.Repeat("é", 100) + "1.txt": "a\npr\nc\n",
 		strings.Repeat("é", 100) + "2.txt": "a\npr\nc\n",
 		strings.Repeat("é", 100) + "3.txt": "a\npr\nc\n",
 	}
 	mainFiles := map[string]string{
-		"ctl\x01x.txt":                     "a\nbase\nc\n",
 		strings.Repeat("é", 100) + "1.txt": "a\nbase\nc\n",
 		strings.Repeat("é", 100) + "2.txt": "a\nbase\nc\n",
 		strings.Repeat("é", 100) + "3.txt": "a\nbase\nc\n",
@@ -787,14 +823,17 @@ func TestRunMergeNoticeListStripsControlAndCapsOnRuneBoundary(t *testing.T) {
 	if !strings.Contains(notice, "::notice::") {
 		t.Fatalf("no notice printed:\n%s", notice)
 	}
-	if strings.ContainsRune(notice, 1) {
-		t.Fatalf("the notice carries a raw control character:\n%q", notice)
-	}
 	if !utf8.ValidString(notice) {
 		t.Fatalf("the notice is not valid UTF-8 (a cut split a character):\n%q", notice)
 	}
 	// The three long names alone are over the 400-byte cap, so the list is
-	// cut -- on a rune boundary, ending in the ellipsis.
+	// cut -- on a rune boundary, ending in the ellipsis. Since the issue #34
+	// tightening of usableMergePath, a conflicted path carrying a control
+	// byte never reaches this notice in a run (runMerge degrades to no merge,
+	// tested in TestRunMergeDegradesCRConflictPathToNoMerge). The stripping
+	// the list still does is a backstop, so this test also drives
+	// printConflictNotice -- the exact function runMerge calls -- with a
+	// control character in the list, and asserts it comes out gone.
 	const listMark = "CodeAF must resolve: "
 	i := strings.Index(notice, listMark)
 	if i < 0 {
@@ -803,6 +842,76 @@ func TestRunMergeNoticeListStripsControlAndCapsOnRuneBoundary(t *testing.T) {
 	list := notice[i+len(listMark):]
 	if len(list) > 400+3 || !strings.HasSuffix(list, "…\n") {
 		t.Fatalf("the list was not capped on a rune boundary (%d bytes):\n%q", len(list), list)
+	}
+	// The stripping the list still does is a backstop: drive
+	// printConflictNotice -- the exact function runMerge calls -- with a
+	// control character in the list and assert it comes out gone, the line
+	// still one line and the name around the stripped byte intact.
+	ctlFiles := append([]string{}, got.Files...)
+	ctlFiles[0] = "ctl\x01" + ctlFiles[0] // first: inside the 400-byte cap, so the name survives the cut
+	oldCtl := os.Stdout
+	rdCtl, wrCtl, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = wrCtl
+	printConflictNotice("pr", "0", "pr", ctlFiles)
+	wrCtl.Close()
+	os.Stdout = oldCtl
+	var ctlBuf bytes.Buffer
+	if _, err := io.Copy(&ctlBuf, rdCtl); err != nil {
+		t.Fatal(err)
+	}
+	ctlNotice := ctlBuf.String()
+	if strings.Count(ctlNotice, "\n") != 1 || !strings.HasSuffix(ctlNotice, "\n") {
+		t.Fatalf("the notice with a control character is not one line: %q", ctlNotice)
+	}
+	for _, b := range []byte(ctlNotice) {
+		if (b < 0x20 && b != '\n') || b == 0x7f {
+			t.Fatalf("the notice carries a raw control byte 0x%02x: %q", b, ctlNotice)
+		}
+	}
+	if !strings.Contains(ctlNotice, "ctl") || !strings.Contains(ctlNotice, "\u00e9") {
+		t.Fatalf("the notice lost the name around the stripped control byte: %q", ctlNotice)
+	}
+}
+
+// Issue #34 security review: the notice's conflicted-file list must never
+// carry a raw control character -- a lone CR breaks the line and the rest of
+// a name would run as a workflow command -- and the cap must not split a
+// multi-byte character.
+func TestPrintConflictNoticeStripsControlCharacters(t *testing.T) {
+	files := []string{
+		"x\r::warning::forged",
+		"ctl\x01x.txt",
+		"del\x7f.txt",
+		strings.Repeat("\u00e9", 100) + "1.txt",
+		strings.Repeat("\u00e9", 100) + "2.txt",
+	}
+	old := os.Stdout
+	rd, wr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = wr
+	printConflictNotice("main", strings.Repeat("c", 40), "pr", files)
+	wr.Close()
+	os.Stdout = old
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, rd); err != nil {
+		t.Fatal(err)
+	}
+	notice := buf.String()
+	if !strings.HasSuffix(notice, "\n") || strings.Count(notice, "\n") != 1 {
+		t.Fatalf("the notice is not exactly one line: %q", notice)
+	}
+	for _, b := range []byte(notice) {
+		if (b < 0x20 && b != '\n') || b == 0x7f {
+			t.Fatalf("the notice carries a raw control byte 0x%02x: %q", b, notice)
+		}
+	}
+	if !utf8.ValidString(notice) {
+		t.Fatalf("the notice is not valid UTF-8 (a cut split a character):\n%q", notice)
 	}
 }
 
@@ -884,6 +993,37 @@ func TestMergeBriefSectionNamesConflictedFiles(t *testing.T) {
 	}
 	if _, err := mergeBriefSection(path); err == nil {
 		t.Fatal("an unreadable conflicted merge must fail the brief")
+	}
+}
+
+// Issue #34 security review: a backtick in a conflicted name would end the
+// inline code span early and let the rest of the name render as brief text.
+// Such a name is listed without a code span, its backticks escaped; the
+// merge info itself keeps the real name.
+func TestMergeBriefSectionEscapesBacktickInName(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "merge-info.json")
+	info := mergeInfo{
+		Kind: mergeKindConflicted, Commit: strings.Repeat("a", 40), Base: strings.Repeat("b", 40),
+		Onto: strings.Repeat("c", 40), Tree: strings.Repeat("d", 40),
+		Files: []string{"a`b.txt"},
+	}
+	data, err := json.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	section, err := mergeBriefSection(path)
+	if err != nil {
+		t.Fatalf("mergeBriefSection: %v", err)
+	}
+	if !strings.Contains(section, "- a\\`b.txt\n") {
+		t.Fatalf("the backtick name is not listed escaped:\n%s", section)
+	}
+	if strings.Contains(section, "`a`b") {
+		t.Fatalf("the backtick name breaks out of a code span:\n%s", section)
 	}
 }
 
@@ -1411,6 +1551,51 @@ func TestVerifyRefusesLeftoverMarkers(t *testing.T) {
 	}
 }
 
+// Issue #34 security review: a conflicted path carrying a raw CR must never
+// reach a ::error:: line -- the runner treats a lone CR as a line break, so
+// the rest of the name would run as a workflow command. verifyMerge refuses
+// the path (one line, the CR escaped by %q), and the marker message itself
+// is printed stripped of control characters as a backstop.
+func TestVerifyMergeNeverPrintsRawControlPath(t *testing.T) {
+	dir := t.TempDir()
+	stateFile := filepath.Join(dir, "state.env")
+	name := "x\r::warning::x"
+	if err := os.WriteFile(filepath.Join(dir, name), []byte("<<<<<<< pr\npr\n=======\nmain\n>>>>>>> main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stateFile, []byte("state=conflicted\nmerged=true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stateFile+".files", []byte(name+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdout
+	rd, wr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = wr
+	err = verifyMerge(dir, stateFile)
+	wr.Close()
+	os.Stdout = old
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, rd); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if err == nil {
+		t.Fatal("verifyMerge accepted a conflicted path with a raw CR")
+	}
+	for label, s := range map[string]string{"stdout": out, "error": err.Error()} {
+		if strings.ContainsAny(s, "\r\x00") || strings.Count(s, "\n") > 1 {
+			t.Fatalf("verifyMerge %s carries a raw CR or more than one line: %q", label, s)
+		}
+	}
+	if !strings.Contains(err.Error(), `x\r::warning::x`) {
+		t.Fatalf("the refusal does not quote the path with the CR escaped: %q", err)
+	}
+}
+
 func TestFindConflictMarker(t *testing.T) {
 	cases := map[string]bool{
 		"<<<<<<< HEAD\n":      true,
@@ -1463,6 +1648,11 @@ func TestReadMergeInfoValidation(t *testing.T) {
 		"path escape":   {Kind: mergeKindConflicted, Commit: good.Commit, Base: good.Base, Onto: good.Onto, Tree: good.Tree, Files: []string{"../f.txt"}},
 		"absolute path": {Kind: mergeKindConflicted, Commit: good.Commit, Base: good.Base, Onto: good.Onto, Tree: good.Tree, Files: []string{"/etc/passwd"}},
 		"newline path":  {Kind: mergeKindConflicted, Commit: good.Commit, Base: good.Base, Onto: good.Onto, Tree: good.Tree, Files: []string{"a\nb"}},
+		// A raw CR or TAB in a recorded path would forge a workflow command
+		// in a ::error:: line (issue #34): every byte below 0x20, and 0x7f,
+		// is refused, on the reader side as on the writer's.
+		"cr path":  {Kind: mergeKindConflicted, Commit: good.Commit, Base: good.Base, Onto: good.Onto, Tree: good.Tree, Files: []string{"x\r::warning::forged"}},
+		"tab path": {Kind: mergeKindConflicted, Commit: good.Commit, Base: good.Base, Onto: good.Onto, Tree: good.Tree, Files: []string{"x\ty"}},
 	}
 	for name, info := range cases {
 		data, _ := json.Marshal(info)

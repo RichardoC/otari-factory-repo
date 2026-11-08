@@ -305,8 +305,18 @@ func commitMerge(dir, tree, ours, theirs, message string) (string, error) {
 // usableMergePath bounds and checks one conflicted path. The paths end up as
 // file reads in publish and as brief text, never inside a shell command.
 func usableMergePath(path string) bool {
-	if path == "" || len(path) > 512 || strings.ContainsAny(path, "\n\x00") {
+	if path == "" || len(path) > 512 {
 		return false
+	}
+	// Not one control byte of any kind (issue #34 security review): unquoting
+	// can bare a raw CR or TAB in a conflicted path, and a lone CR breaks a
+	// log line -- the runner treats it as a line break, so the rest of the
+	// name would run as a workflow command. \n and \x00 are covered too; the
+	// #22 rule is that no raw control character reaches a log line.
+	for i := 0; i < len(path); i++ {
+		if path[i] < 0x20 || path[i] == 0x7f {
+			return false
+		}
 	}
 	if strings.HasPrefix(path, "/") || strings.HasPrefix(path, "-") {
 		return false
@@ -733,14 +743,7 @@ func runMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile string, compar
 		return out, fmt.Errorf("wrote the merge commit but could not clear the no-merge record: %w", err)
 	}
 	if conflicted {
-		// Unquoted paths can hold non-ASCII bytes and control characters:
-		// strip the controls (a notice line must not carry them), and cap
-		// on a rune boundary so the cut cannot split a character.
-		list := stripControl(strings.Join(files, ", "))
-		if len(list) > 400 {
-			list = capUTF8(list, 400) + "…"
-		}
-		fmt.Printf("::notice::merged %s (%s) into %s with conflicts; CodeAF must resolve: %s\n", baseRef, shortSHA(onto), branch, list)
+		printConflictNotice(baseRef, onto, branch, files)
 	} else {
 		fmt.Printf("::notice::merged %s (%s) into %s cleanly\n", baseRef, shortSHA(onto), branch)
 	}
@@ -748,6 +751,20 @@ func runMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile string, compar
 		fmt.Printf("::notice::the merge carries %s .github/ changes; publishing it waits for a maintainer approval (the codeaf-harness environment)\n", baseRef)
 	}
 	return out, nil
+}
+
+// printConflictNotice prints the run job's ::notice:: about a conflicted
+// merge. Unquoted paths can hold non-ASCII bytes and control characters
+// (issue #33): the controls are stripped -- a notice line must not carry
+// them, and a raw CR would forge a workflow command (issue #34) -- and the
+// list is capped on a rune boundary so the cut cannot split a character
+// (issue #22).
+func printConflictNotice(baseRef, onto, branch string, files []string) {
+	list := stripControl(strings.Join(files, ", "))
+	if len(list) > 400 {
+		list = capUTF8(list, 400) + "…"
+	}
+	fmt.Printf("::notice::merged %s (%s) into %s with conflicts; CodeAF must resolve: %s\n", baseRef, shortSHA(onto), branch, list)
 }
 
 // publishMerge is the publish half of issues #57 and #171. With the run's
@@ -1339,7 +1356,10 @@ func verifyMerge(dir, stateFile string) error {
 	}
 	if len(marked) > 0 {
 		for _, m := range marked {
-			fmt.Printf("::error::conflict marker left in %s\n", m)
+			// Backstop (issue #34 security review): no raw path reaches a
+			// ::error:: line even if the path check above ever changes --
+			// a raw CR would forge a workflow command.
+			fmt.Printf("::error::conflict marker left in %s\n", stripControl(m))
 		}
 		return fmt.Errorf("%d conflicted file(s) still carry conflict markers; every conflict must be resolved before publishing", len(marked))
 	}
@@ -1650,7 +1670,16 @@ func mergeBriefSection(path string) (string, error) {
 		fmt.Fprintf(&b, "HEAD is now a merge commit that brings the base branch tip %s into this branch. "+
 			"The merge conflicts in these files, which currently carry conflict markers:\n\n", shortSHA(info.Onto))
 		for _, f := range info.Files {
-			fmt.Fprintf(&b, "- `%s`\n", f)
+			// A backtick in a name would end the inline code span early and
+			// let the rest of the name render as brief text (issue #34
+			// security review). A backslash escape does not work inside a
+			// code span, so such a name is listed without one instead, the
+			// backticks escaped; the merge info itself keeps the real name.
+			if strings.Contains(f, "`") {
+				fmt.Fprintf(&b, "- %s\n", strings.ReplaceAll(f, "`", "\\`"))
+			} else {
+				fmt.Fprintf(&b, "- `%s`\n", f)
+			}
 		}
 		b.WriteString("\nResolve every conflict in place: keep the intended code and delete every conflict marker line " +
 			"(the lines starting with `<<<<<<<`, `=======` and `>>>>>>>`). The publish step refuses to push anything " +

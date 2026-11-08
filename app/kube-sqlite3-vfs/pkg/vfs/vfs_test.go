@@ -3757,3 +3757,104 @@ func TestNewVFSNonPositiveLockLeaseKeepsDefault(t *testing.T) {
 		})
 	}
 }
+
+func TestFullPathname(t *testing.T) {
+	v, _ := newTestVFS(t)
+
+	// Different spellings of the same relative name must canonicalise to
+	// one name, so one database cannot split into two ConfigMap sets
+	// depending on how it was opened. Absolute names are cleaned too, but
+	// stay absolute.
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "dot slash", in: "./app.db", want: "app.db"},
+		{name: "dotdot traversal", in: "dir/../app.db", want: "app.db"},
+		{name: "already clean", in: "app.db", want: "app.db"},
+		{name: "absolute", in: "/data/app.db", want: "/data/app.db"},
+		{name: "absolute clean", in: "/data/sub/../app.db", want: "/data/app.db"},
+		{name: "trailing slash removed", in: "app.db/", want: "app.db"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := v.FullPathname(tc.in); got != tc.want {
+				t.Errorf("FullPathname(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFullPathnameEndToEnd proves the canonicalisation through SQLite
+// itself, not only through the VFS method: a database written as rev.db
+// reads back when reopened under unclean spellings of the same name via
+// file: URIs, and the rollback journal a write creates lands under the
+// canonical name too — SQLite appends -journal to the canonicalised name,
+// so the journal of ./rev.db is stored as rev.db-journal, never as
+// ./rev.db-journal.
+func TestFullPathnameEndToEnd(t *testing.T) {
+	v, fcs := newTestVFS(t)
+	vfsName := registerUniqueVFS(t, v)
+
+	db := openSQLDBWithJournal(t, vfsName, "rev.db", "DELETE")
+	if _, err := db.Exec(`CREATE TABLE rev (k TEXT NOT NULL PRIMARY KEY, v TEXT NOT NULL)`); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO rev (k, v) VALUES ('answer', '42')`); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	for _, spelling := range []string{"./rev.db", "sub/../rev.db"} {
+		t.Run(spelling, func(t *testing.T) {
+			ddb := openSQLDBWithJournal(t, vfsName, spelling, "DELETE")
+			defer ddb.Close()
+			var got string
+			if err := ddb.QueryRow(`SELECT v FROM rev WHERE k = 'answer'`).Scan(&got); err != nil {
+				t.Fatalf("read back through %q: %v", spelling, err)
+			}
+			if got != "42" {
+				t.Fatalf("read back through %q = %q, want %q", spelling, got, "42")
+			}
+
+			// While this connection holds a write transaction open, its
+			// rollback journal exists on the cluster. Every sector
+			// ConfigMap of that journal must carry the canonical journal
+			// name's relevant-file label — and no ConfigMap may carry the
+			// label of the unclean spelling.
+			tx, err := ddb.Begin()
+			if err != nil {
+				t.Fatalf("Begin: %v", err)
+			}
+			if _, err := tx.Exec(`INSERT INTO rev (k, v) VALUES ('tx', 'open')`); err != nil {
+				t.Fatalf("INSERT in tx: %v", err)
+			}
+			wantLabel := NewFile("rev.db-journal", v).relevantFileLabel()
+			uncleanLabel := NewFile("./rev.db-journal", v).relevantFileLabel()
+			cms, err := fcs.CoreV1().ConfigMaps(testNamespace).List(t.Context(), metav1.ListOptions{})
+			if err != nil {
+				t.Fatalf("List ConfigMaps: %v", err)
+			}
+			journalSectors := 0
+			for _, cm := range cms.Items {
+				switch cm.Labels["relevant-file"] {
+				case wantLabel:
+					if cm.Labels["data"] == "sector" {
+						journalSectors++
+					}
+				case uncleanLabel:
+					t.Errorf("ConfigMap %s carries the label of the unclean journal name %q; the journal must follow the canonical name rev.db-journal", cm.Name, "./rev.db-journal")
+				}
+			}
+			if journalSectors == 0 {
+				t.Fatalf("no journal sector ConfigMaps found under the canonical journal label %q", wantLabel)
+			}
+			if err := tx.Rollback(); err != nil {
+				t.Fatalf("Rollback: %v", err)
+			}
+		})
+	}
+}

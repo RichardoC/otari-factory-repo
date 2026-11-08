@@ -156,7 +156,7 @@ func gitOutput(dir string, args ...string) (string, error) {
 		if len(stderr) > 300 {
 			stderr = stderr[:300]
 		}
-		return out.String(), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, stderr)
+		return out.String(), newGitError(args, err, stderr)
 	}
 	return out.String(), nil
 }
@@ -176,7 +176,7 @@ func gitOutputAs(dir string, args ...string) (string, error) {
 		if len(stderr) > 300 {
 			stderr = stderr[:300]
 		}
-		return out.String(), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, stderr)
+		return out.String(), newGitError(args, err, stderr)
 	}
 	return out.String(), nil
 }
@@ -482,6 +482,30 @@ func stripControl(s string) string {
 		}
 		return r
 	}, s)
+}
+
+// gitError is a failed git command. Its message is built once and stripped of
+// control characters: the arguments can carry a path (blobEntry passes one
+// unquoted) and git's stderr can carry whatever it prints, so either could
+// hold a raw CR or newline that forges a workflow command in the Actions log
+// (issue #42). Unwrap keeps the exit status available to callers that check
+// it (git merge-tree exits 1 on a conflict).
+type gitError struct {
+	msg string
+	err error
+}
+
+func (e *gitError) Error() string { return e.msg }
+
+func (e *gitError) Unwrap() error { return e.err }
+
+// newGitError builds a gitError whose message carries the command, the exit
+// error and the first of stderr, all stripped of control characters.
+func newGitError(args []string, err error, stderr string) error {
+	return &gitError{
+		msg: stripControl(fmt.Sprintf("git %s: %v: %s", strings.Join(args, " "), err, stderr)),
+		err: err,
+	}
 }
 
 // mergeNotMade records that the run job merged nothing, and why. The reason
@@ -1616,7 +1640,7 @@ func gitEnvOutput(dir string, env []string, args ...string) (string, error) {
 		if len(stderr) > 300 {
 			stderr = stderr[:300]
 		}
-		return out.String(), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, stderr)
+		return out.String(), newGitError(args, err, stderr)
 	}
 	return out.String(), nil
 }

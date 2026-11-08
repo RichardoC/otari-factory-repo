@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // planWellFormed is a well-formed answer carrying three proposals: all four
@@ -369,6 +370,20 @@ func TestProposalLabelsArea(t *testing.T) {
 	// A name that fits whole is not touched.
 	if got := ProposalLabels(Proposal{Area: "app/widgets"}); got[1] != "area:app/widgets" {
 		t.Errorf("short area changed: got %v", got)
+	}
+	// A long multi-byte name: GitHub's 50 limit is bytes, so 41 runes of a
+	// 3-byte character are 123 bytes and must be cut to fit (issue #40),
+	// without splitting a character — the label stays valid UTF-8.
+	multi := "app/" + strings.Repeat("日", 60)
+	got = ProposalLabels(Proposal{Area: multi})
+	if len(got) != 2 || !strings.HasPrefix(got[1], "area:app/") {
+		t.Errorf("multi-byte area: got %v", got)
+	}
+	if len(got[1]) > 50 {
+		t.Errorf("multi-byte area label is %d bytes, want at most 50: %q", len(got[1]), got[1])
+	}
+	if !utf8.ValidString(got[1]) {
+		t.Errorf("multi-byte area label is not valid UTF-8: %q", got[1])
 	}
 }
 

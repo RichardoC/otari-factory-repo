@@ -369,8 +369,10 @@ func ProposalLabels(p Proposal) []string {
 		// The label name is capped like any other GitHub label (issue #40):
 		// truncate the app name so the full label fits, rather than dropping
 		// the label or letting an over-long one break opening the issue.
-		// The body keeps rendering the untruncated Area.
-		name := planTruncate(strings.TrimPrefix(p.Area, "app/"), maxAreaLabelLen-len("area:app/"))
+		// The body keeps rendering the untruncated Area. GitHub counts the
+		// 50-name limit in bytes, so the cap is capUTF8, not planTruncate:
+		// a name of 41 multi-byte runes (82 bytes) would still be over.
+		name := capUTF8(strings.TrimPrefix(p.Area, "app/"), maxAreaLabelLen-len("area:app/"))
 		labels = append(labels, "area:app/"+name)
 	}
 	return labels

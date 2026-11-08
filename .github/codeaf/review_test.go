@@ -1594,6 +1594,74 @@ func TestRunReviewConfig(t *testing.T) {
 	}
 }
 
+// TestCapReviewBodyAndDiffText holds the two cap helpers to their contracts
+// directly (review follow-up on #38): a body cut never splits a rune and
+// always ends in a note that names it, even when the budget is too small for
+// any body text, and a re-capped diff keeps the fetch note whatever budget is
+// left — including a budget of zero, where the note alone says why.
+func TestCapReviewBodyAndDiffText(t *testing.T) {
+	t.Run("capReviewBody", func(t *testing.T) {
+		if got := capReviewBody("", "pull request body", 100); got != "" {
+			t.Errorf("an empty body must stay empty, got %q", got)
+		}
+		if got := capReviewBody("small body", "pull request body", 100); got != "small body" {
+			t.Errorf("a body under the cap must pass through, got %q", got)
+		}
+		body := strings.Repeat("ab\n", 200)
+		got := capReviewBody(body, "pull request body", 100)
+		if len(got) != 100 {
+			t.Errorf("a cut body is %d bytes, want exactly the cap", len(got))
+		}
+		if !strings.HasPrefix(got, "ab\n") || !strings.HasSuffix(got, "(pull request body truncated at 100 bytes)\n") {
+			t.Errorf("a cut body must keep its head and end in a note naming it, got %q", got)
+		}
+		// The omission branch: no room even for the truncation note, so the
+		// note that names the section is all that survives.
+		for _, max := range []int{0, 20} {
+			got := capReviewBody(body, "closing issue body", max)
+			if got != "\n\n(closing issue body omitted: the brief is over its size limit)\n" {
+				t.Errorf("max=%d: a body with no room even for its note must keep the omission note, got %q", max, got)
+			}
+		}
+		// The cut never splits a UTF-8 rune: the multibyte character just
+		// before the cut point steps back whole.
+		utf := strings.Repeat("x", 90) + "é" + strings.Repeat("y", 200)
+		if got := capReviewBody(utf, "pull request body", 100); !utf8.ValidString(got) {
+			t.Errorf("a cut body split a UTF-8 rune: %q", got[len(got)-10:])
+		}
+	})
+
+	t.Run("cappedDiffText", func(t *testing.T) {
+		note := diffFetchNote()
+		if !strings.Contains(note, "(diff truncated at") {
+			t.Fatalf("diffFetchNote changed shape: %q", note)
+		}
+		// A truncated fetch keeps the fetch note at the end, inside the budget.
+		diff := strings.Repeat("+ a hostile diff line\n", 400)
+		got := cappedDiffText(diff, 1000, true)
+		if len(got) > 1000 {
+			t.Errorf("a re-capped diff is %d bytes, budget 1000", len(got))
+		}
+		if !strings.HasPrefix(got, "+ a hostile diff line\n") || !strings.HasSuffix(got, note) {
+			t.Errorf("a re-capped diff must keep its head and end in the fetch note, got %q", got)
+		}
+		// No room for any diff text: the note alone says why.
+		if got := cappedDiffText(diff, len(note), true); got != note {
+			t.Errorf("a budget of exactly the note must return the note alone, got %d bytes", len(got))
+		}
+		if got := cappedDiffText(diff, 0, true); got != note {
+			t.Errorf("a zero budget must return the note alone, got %d bytes", len(got))
+		}
+		// Not truncated: the plain capDiff path, no fetch note appended.
+		if got := cappedDiffText(diff, 1000, false); strings.Contains(got, "the rest was not fetched") {
+			t.Errorf("a diff the fetch returned whole must not carry the fetch note: %q", got)
+		}
+		if got := cappedDiffText(diff, len(diff), false); got != diff {
+			t.Errorf("a diff under the cap must pass through whole, got %d bytes", len(got))
+		}
+	})
+}
+
 func TestRunReviewBrief(t *testing.T) {
 	routes := map[string]string{
 		"/repos/RichardoC/factory-repo/pulls/7":           `{"number":7,"title":"Review target","body":"The change.\n\nCloses #3","state":"open","head":{"ref":"codeaf/issue-3-42"},"base":{"ref":"main"}}`,
@@ -1804,6 +1872,134 @@ func TestRunReviewBrief(t *testing.T) {
 		if !strings.Contains(string(data), p) {
 			t.Errorf("the capped brief lost %q", p)
 		}
+	}
+
+	// Issue #38: a 65000-byte PR body and a 65000-byte closing-issue body
+	// beside a ~59 KB diff must not push the diff and the output contract past
+	// the whole-brief cap. Each body is capped on its own with a note naming
+	// it, the diff stays whole (it fits under its own cap), and the contract
+	// survives.
+	padTo := func(prefix string, n int) string {
+		s := strings.Repeat(prefix, n/len(prefix)+1)
+		return s[:n]
+	}
+	prText := "Closes #3\n\n" + padTo("pr body line\n", 65000-len("Closes #3\n\n"))
+	issueText := padTo("issue body line\n", 65000)
+	bigDiff := diffFile("app/huge.go", 2500)
+	if len(bigDiff) >= maxReviewDiffBytes || len(bigDiff) < 50000 {
+		t.Fatalf("test diff is %d bytes, want ~59 KB under the %d cap", len(bigDiff), maxReviewDiffBytes)
+	}
+	bigRoutes := map[string]string{
+		"/repos/RichardoC/factory-repo/pulls/7":           `{"number":7,"title":"Review target","body":` + fmt.Sprintf("%q", prText) + `,"state":"open","head":{"ref":"codeaf/issue-3-42"},"base":{"ref":"main"}}`,
+		"/repos/RichardoC/factory-repo/issues/3":          `{"number":3,"title":"The task","body":` + fmt.Sprintf("%q", issueText) + `}`,
+		"/repos/RichardoC/factory-repo/issues/7/comments": `[]`,
+	}
+	ghEnv(t, reviewServer(t, bigRoutes, bigDiff, nil))
+	briefPath = filepath.Join(t.TempDir(), "big-bodies.md")
+	t.Setenv("NUMBER", "7")
+	t.Setenv("BRIEF_PATH", briefPath)
+	if _, err := captureStdout(t, runReviewBrief); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b = string(data)
+	if len(b) > maxBriefBytes {
+		t.Errorf("brief is %d bytes, cap is %d", len(b), maxBriefBytes)
+	}
+	if !strings.Contains(b, reviewOutputContract) {
+		t.Errorf("the output contract was cut from the brief")
+	}
+	if !strings.Contains(b, bigDiff) && !strings.Contains(b, "(diff truncated at ") {
+		t.Errorf("the diff is neither whole nor noted as truncated")
+	}
+	for _, name := range []string{"pull request body truncated", "closing issue body truncated"} {
+		if !strings.Contains(b, name) {
+			t.Errorf("the capped brief does not name the dropped section %q", name)
+		}
+	}
+
+	// Review follow-up on #38, the overflow branch: four app AGENTS.md
+	// sections (each capped at maxAppRulesBytes) in issueRules push the fixed
+	// sections past maxBriefBytes even with empty bodies, so the diff gives
+	// way. The brief stays within the cap, the output contract survives, the
+	// diff carries a truncation note, and both bodies keep a note naming
+	// them even though the room the fixed sections leave is far smaller than
+	// either body.
+	overPR := "Closes #3\n\n" + padTo("pr overflow line\n", 30000-len("Closes #3\n\n"))
+	overIssue := "Areas: app/ovfa/queue.go app/ovfb/queue.go app/ovfc/queue.go app/ovfd/queue.go\n\n" +
+		padTo("issue overflow line\n", 65000)
+	overRoutes := map[string]string{
+		"/repos/RichardoC/factory-repo/pulls/7":           `{"number":7,"title":"Review target","body":` + fmt.Sprintf("%q", overPR) + `,"state":"open","head":{"ref":"codeaf/issue-3-42"},"base":{"ref":"main"}}`,
+		"/repos/RichardoC/factory-repo/issues/3":          `{"number":3,"title":"The task","body":` + fmt.Sprintf("%q", overIssue) + `}`,
+		"/repos/RichardoC/factory-repo/issues/7/comments": `[]`,
+	}
+	for _, name := range []string{"ovfa", "ovfb", "ovfc", "ovfd"} {
+		// ~24 KB each, capped to maxAppRulesBytes in the section: four of
+		// them plus the ~59 KB diff overrun maxBriefBytes on their own.
+		withAppRules(overRoutes, name, strings.Repeat("rule line for "+name+"\n", 1200))
+	}
+	ghEnv(t, reviewServer(t, overRoutes, bigDiff, nil))
+	briefPath = filepath.Join(t.TempDir(), "overflow.md")
+	t.Setenv("NUMBER", "7")
+	t.Setenv("BRIEF_PATH", briefPath)
+	if _, err := captureStdout(t, runReviewBrief); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b = string(data)
+	if len(b) > maxBriefBytes {
+		t.Errorf("overflow brief is %d bytes, cap is %d", len(b), maxBriefBytes)
+	}
+	if !strings.Contains(b, "## Rules for app/ovfa") {
+		t.Errorf("the overflow brief lost the app rules that push the base over the cap")
+	}
+	if !strings.Contains(b, reviewOutputContract) {
+		t.Errorf("the output contract was cut from the overflow brief")
+	}
+	if !strings.Contains(b, "(diff truncated at ") {
+		t.Errorf("the overflow brief does not note the diff truncation")
+	}
+	for _, name := range []string{"(pull request body ", "(closing issue body "} {
+		if !strings.Contains(b, name) {
+			t.Errorf("the overflow brief does not name the dropped section %q", name)
+		}
+	}
+
+	// Review follow-up on #38: a PR with no linked issue gets more than half
+	// the room for its body. The body ends in a unique marker and is longer
+	// than room/2, so only the whole-body share keeps the marker: the old
+	// room/2 share (about 43 KB here) cut the body mid-text with no issue
+	// body to blame, losing the marker and adding the truncation note.
+	freePR := padTo("free pr body line\n", 58000) + "END-OF-FREE-PR-BODY"
+	freeRoutes := map[string]string{
+		"/repos/RichardoC/factory-repo/pulls/7":           `{"number":7,"title":"No issue","body":` + fmt.Sprintf("%q", freePR) + `,"state":"open","head":{"ref":"feat"},"base":{"ref":"main"}}`,
+		"/repos/RichardoC/factory-repo/issues/7/comments": `[]`,
+	}
+	ghEnv(t, reviewServer(t, freeRoutes, diffBody, nil))
+	briefPath = filepath.Join(t.TempDir(), "free-pr.md")
+	t.Setenv("BRIEF_PATH", briefPath)
+	if _, err := captureStdout(t, runReviewBrief); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b = string(data)
+	if len(b) > maxBriefBytes {
+		t.Errorf("brief is %d bytes, cap is %d", len(b), maxBriefBytes)
+	}
+	if !strings.Contains(b, "END-OF-FREE-PR-BODY") {
+		t.Errorf("the end of the %d-byte PR body was cut: with no linked issue the body must get more than half the room", len(freePR))
+	}
+	if strings.Contains(b, "pull request body truncated") {
+		t.Errorf("a PR body that fits under the room must not be truncated: %d bytes into a brief of %d", len(freePR), maxBriefBytes)
 	}
 
 	// Required inputs are refused loudly.

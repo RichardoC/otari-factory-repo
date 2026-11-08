@@ -1487,6 +1487,29 @@ func cappedDiffForBrief(diff string, truncated bool) string {
 // of a .github/codeaf/ diff rebuilds from the diff's tree.
 const reviewHarnessPreChangeSentence = "the `harness` binary on `PATH` was built from the default\nbranch before this run started"
 
+// capReviewBody caps one untrusted review-brief body on its own (issue #38)
+// so it cannot crowd the diff and the machine-parsed output contract out of
+// the whole brief. The note names the section and counts against max; when
+// max is smaller than the note there is no room to say so, and the body is
+// dropped rather than exceeding the budget.
+func capReviewBody(s, name string, max int) string {
+	if max < 0 {
+		max = 0
+	}
+	if len(s) <= max {
+		return s
+	}
+	note := fmt.Sprintf("\n\n(%s truncated at %d bytes)\n", name, max)
+	if max < len(note) {
+		return ""
+	}
+	cut := max - len(note)
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + note
+}
+
 // runReviewBrief implements `harness review-brief` (issue #32): the review
 // run's brief. It mirrors runBrief's conventions — the budget line, the
 // standing instructions from the harness directory, sections joined by a
@@ -1506,39 +1529,92 @@ func runReviewBrief() error {
 	if err != nil {
 		return err
 	}
-	parts := []string{budgetLine(), string(standing)}
+	budget := budgetLine()
+	standingText := string(standing)
 
 	var pr item
 	if err := gh.get(fmt.Sprintf("/pulls/%d", number), &pr); err != nil {
 		return err
 	}
-	parts = append(parts, fmt.Sprintf("# The pull request under review: #%d — %s\n\nHead branch `%s`, base branch `%s`.\n\n%s",
-		number, pr.Title, pr.Head.Ref, pr.Base.Ref, pr.Body))
+	prHeading := fmt.Sprintf("# The pull request under review: #%d — %s\n\nHead branch `%s`, base branch `%s`.\n\n",
+		number, pr.Title, pr.Head.Ref, pr.Base.Ref)
 	// What the review judges the diff against is the issue the pull request
 	// closes (issue #32), read exactly as runBrief reads it: an API failure
 	// degrades to a note and must not fail the brief.
+	var issueHeading, issueBody, issueRules string
 	if n := linkedIssue(pr.Body); n != 0 {
 		var closes item
 		if err := gh.get(fmt.Sprintf("/issues/%d", n), &closes); err != nil {
-			parts = append(parts, fmt.Sprintf("(the issue this PR closes, #%d, is unavailable: %s)\n", n, escapeMD(err.Error(), 200, true)))
+			issueHeading = fmt.Sprintf("(the issue this PR closes, #%d, is unavailable: %s)\n", n, escapeMD(err.Error(), 200, true))
 		} else {
-			parts = append(parts, fmt.Sprintf("## The issue this PR closes (#%d) — %s\n\n%s", n, escapeMD(closes.Title, 200, true), closes.Body))
+			issueHeading = fmt.Sprintf("## The issue this PR closes (#%d) — %s\n\n", n, escapeMD(closes.Title, 200, true))
+			issueBody = closes.Body
 			// Issue #139: the app rules travel with the issue, exactly as
 			// runBrief embeds them for the worker.
-			if rules := appRulesSections(gh, issueAreas(closes)); rules != "" {
-				parts = append(parts, rules)
-			}
+			issueRules = appRulesSections(gh, issueAreas(closes))
 		}
 	}
 	diff, truncated, err := gh.diff(number)
 	if err != nil {
 		return err
 	}
-	parts = append(parts, "# The diff under review\n\n```diff\n"+cappedDiffForBrief(diff, truncated)+"\n```")
-	parts = append(parts, previousReportSection(gh, number))
-	parts = append(parts, reviewOutputContract)
+	diffText := cappedDiffForBrief(diff, truncated)
+	diffSection := "# The diff under review\n\n```diff\n" + diffText + "\n```"
+	reportSection := previousReportSection(gh, number)
 
-	brief := capBrief(strings.Join(parts, "\n\n")+"\n", maxBriefBytes)
+	// Issue #38: cap the two untrusted bodies on their own before joining.
+	// The whole-brief cap used to cut through the diff and drop the output
+	// contract, with only an anonymous note. The fixed sections are measured
+	// first; the room they leave under maxBriefBytes is split between the
+	// bodies, each cut carrying a note that names it. A short body leaves its
+	// unused room to the other, and an empty optional section is omitted so it
+	// adds no separator.
+	build := func(prBody, issueText string) string {
+		all := []string{
+			budget, standingText,
+			prHeading + prBody,
+			issueHeading + issueText,
+			issueRules,
+			diffSection,
+			reportSection,
+			reviewOutputContract,
+		}
+		parts := make([]string, 0, len(all))
+		for _, p := range all {
+			if p != "" {
+				parts = append(parts, p)
+			}
+		}
+		return strings.Join(parts, "\n\n") + "\n"
+	}
+	base := build("", "")
+	// The fixed sections can overrun the cap on their own only if the standing
+	// instructions or the previous report grow without bound. The diff then
+	// gives way first, always with its own truncation note, so the output
+	// contract still reaches the reviewer.
+	if len(base) > maxBriefBytes {
+		// overhead is the section's heading and code fence around diffText.
+		overhead := len(diffSection) - len(diffText)
+		room := maxBriefBytes - (len(base) - len(diffSection)) - overhead
+		if room < capDiffFloorBytes {
+			room = capDiffFloorBytes
+		}
+		diffText = capDiff(diff, room)
+		diffSection = "# The diff under review\n\n```diff\n" + diffText + "\n```"
+		base = build("", "")
+	}
+	room := maxBriefBytes - len(base)
+	if room < 0 {
+		room = 0
+	}
+	prBody := capReviewBody(pr.Body, "pull request body", room/2)
+	issueBody = capReviewBody(issueBody, "closing issue body", room-len(prBody))
+	brief := build(prBody, issueBody)
+	if len(brief) > maxBriefBytes {
+		// Unreachable while the fixed sections stay bounded; retained so a
+		// future unbounded section degrades to the old whole-brief note.
+		brief = capBrief(brief, maxBriefBytes)
+	}
 	fmt.Print(brief)
 	if err := os.MkdirAll(filepath.Dir(briefPath), 0o755); err != nil {
 		return err

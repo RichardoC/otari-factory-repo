@@ -1806,6 +1806,53 @@ func TestRunReviewBrief(t *testing.T) {
 		}
 	}
 
+	// Issue #38: a 65000-byte PR body and a 65000-byte closing-issue body
+	// beside a ~59 KB diff must not push the diff and the output contract past
+	// the whole-brief cap. Each body is capped on its own with a note naming
+	// it, the diff stays whole (it fits under its own cap), and the contract
+	// survives.
+	padTo := func(prefix string, n int) string {
+		s := strings.Repeat(prefix, n/len(prefix)+1)
+		return s[:n]
+	}
+	prText := "Closes #3\n\n" + padTo("pr body line\n", 65000-len("Closes #3\n\n"))
+	issueText := padTo("issue body line\n", 65000)
+	bigDiff := diffFile("app/huge.go", 2500)
+	if len(bigDiff) >= maxReviewDiffBytes || len(bigDiff) < 50000 {
+		t.Fatalf("test diff is %d bytes, want ~59 KB under the %d cap", len(bigDiff), maxReviewDiffBytes)
+	}
+	bigRoutes := map[string]string{
+		"/repos/RichardoC/factory-repo/pulls/7":           `{"number":7,"title":"Review target","body":` + fmt.Sprintf("%q", prText) + `,"state":"open","head":{"ref":"codeaf/issue-3-42"},"base":{"ref":"main"}}`,
+		"/repos/RichardoC/factory-repo/issues/3":          `{"number":3,"title":"The task","body":` + fmt.Sprintf("%q", issueText) + `}`,
+		"/repos/RichardoC/factory-repo/issues/7/comments": `[]`,
+	}
+	ghEnv(t, reviewServer(t, bigRoutes, bigDiff, nil))
+	briefPath = filepath.Join(t.TempDir(), "big-bodies.md")
+	t.Setenv("NUMBER", "7")
+	t.Setenv("BRIEF_PATH", briefPath)
+	if _, err := captureStdout(t, runReviewBrief); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b = string(data)
+	if len(b) > maxBriefBytes {
+		t.Errorf("brief is %d bytes, cap is %d", len(b), maxBriefBytes)
+	}
+	if !strings.Contains(b, reviewOutputContract) {
+		t.Errorf("the output contract was cut from the brief")
+	}
+	if !strings.Contains(b, bigDiff) && !strings.Contains(b, "(diff truncated at ") {
+		t.Errorf("the diff is neither whole nor noted as truncated")
+	}
+	for _, name := range []string{"pull request body truncated", "closing issue body truncated"} {
+		if !strings.Contains(b, name) {
+			t.Errorf("the capped brief does not name the dropped section %q", name)
+		}
+	}
+
 	// Required inputs are refused loudly.
 	t.Setenv("BRIEF_PATH", "")
 	if _, err := captureStdout(t, runReviewBrief); err == nil {

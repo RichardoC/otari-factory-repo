@@ -71,6 +71,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // The two kinds a merge can have, as recorded in merge-info.json.
@@ -436,6 +437,37 @@ func runStateFile(mergeInfoFile string) string {
 	return mergeInfoFile + ".run"
 }
 
+// maxNoMergeReasonBytes caps a recorded or rendered no-merge reason, and the
+// skip-warning message built from the same kind of error text. A reason can
+// carry non-ASCII paths from git or API error text (issue #22).
+const maxNoMergeReasonBytes = 300
+
+// capUTF8 caps s at max bytes without splitting a UTF-8 rune: it walks back
+// from the cut until text[cut] starts a rune. It is the rune-safe form of a
+// plain s[:max] (issue #22), like capAppFile (apprules.go).
+func capUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
+// stripControl removes control characters, including newlines, from untrusted
+// text -- bytes below 32 and 127 -- so it cannot break a log line or forge a
+// workflow command (issue #22).
+func stripControl(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 32 || r == 127 {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 // mergeNotMade records that the run job merged nothing, and why. The reason
 // is error text, so it is bounded and stripped of control characters: this
 // file is run-job output, untrusted like the rest (AGENTS.md, "Security
@@ -446,18 +478,11 @@ func mergeNotMade(mergeInfoFile, format string, args ...any) {
 	if mergeInfoFile == "" {
 		return
 	}
-	reason := strings.Map(func(r rune) rune {
-		if r < 32 {
-			return -1 // control characters, including newlines
-		}
-		return r
-	}, strings.TrimSpace(fmt.Sprintf(format, args...)))
+	reason := stripControl(strings.TrimSpace(fmt.Sprintf(format, args...)))
 	if reason == "" {
 		return
 	}
-	if len(reason) > 300 {
-		reason = reason[:300]
-	}
+	reason = capUTF8(reason, maxNoMergeReasonBytes)
 	if err := os.WriteFile(runStateFile(mergeInfoFile), []byte("state=none\nreason="+reason+"\n"), 0o644); err != nil {
 		log.Printf("merge-default: could not record why no merge was made: %v", err)
 	}
@@ -1021,9 +1046,15 @@ func mergeApproved() bool {
 // also reaches the job log, so the approver sees the base was not merged
 // after all instead of reading a green run as if it had been.
 func mergeSkipped(format string, args ...any) {
-	log.Printf("merge-default: %s", fmt.Sprintf(format, args...))
+	// The message carries baseRef, git error text and lists of gated paths,
+	// none of it trusted: diffNameOnly unquotes git's C-quoting, so a path can
+	// contain a raw newline and start a ::command:: line in the workflow log.
+	// Build the message once, strip control characters and cap it before both
+	// the log line and the ::warning:: line (issue #22).
+	msg := capUTF8(stripControl(fmt.Sprintf(format, args...)), maxNoMergeReasonBytes)
+	log.Printf("merge-default: %s", msg)
 	if mergeApproved() {
-		fmt.Printf("::warning::the base merge was skipped: %s\n", fmt.Sprintf(format, args...))
+		fmt.Printf("::warning::the base merge was skipped: %s\n", msg)
 	}
 }
 
@@ -1477,9 +1508,9 @@ func gitEnvOutput(dir string, env []string, args ...string) (string, error) {
 //	    publish, after the patch: refuse while a conflict marker remains in a
 //	    conflicted file.
 //	harness merge-default workflows MERGE_INFO_FILE
-//	    run job, packaging: print whether the recorded merge carries the base
-//	    branch's workflow changes (issue #16), so the step routes publish
-//	    into the codeaf-harness environment. The file is read through the
+//	    run job, packaging: print whether the recorded merge carries gated
+//	    .github/ changes (issue #16; widened by issue #20), so the step routes
+//	    publish into the codeaf-harness environment. The file is read through the
 //	    validating reader, never parsed in shell; a missing file reads false.
 //
 // Every other phase is a no-op outside pr mode, so review and issue runs are
@@ -1574,7 +1605,7 @@ func mergeBriefSection(path string) (string, error) {
 			"branch now, not of your patch, unless you edit them.\n", shortSHA(info.Onto))
 	}
 	if info.Workflows {
-		fmt.Fprintf(&b, "\nThe merge carries the base branch's workflow changes, so publishing this branch waits for a "+
+		fmt.Fprintf(&b, "\nThe merge carries gated .github/ changes, so publishing this branch waits for a "+
 			"maintainer's approval of the codeaf-harness environment; that is expected, and not something you act on.\n")
 	}
 	return strings.TrimRight(b.String(), "\n"), nil
@@ -1595,15 +1626,7 @@ func noMergeBriefSection(path string) (string, error) {
 	reason := ""
 	for _, line := range strings.Split(string(data), "\n") {
 		if v, ok := strings.CutPrefix(line, "reason="); ok {
-			reason = strings.Map(func(r rune) rune {
-				if r < 32 || r == 127 {
-					return -1
-				}
-				return r
-			}, strings.TrimSpace(v))
-			if len(reason) > 300 {
-				reason = reason[:300]
-			}
+			reason = capUTF8(stripControl(strings.TrimSpace(v)), maxNoMergeReasonBytes)
 		}
 	}
 	if reason == "" {

@@ -81,6 +81,10 @@ func (c *recordingCache) Save(context.Context, cache.Snapshot) error {
 	return nil
 }
 
+func (c *recordingCache) IgnoreEvictions() cache.IgnoreEvictionCounts {
+	return cache.IgnoreEvictionCounts{}
+}
+
 // failingLinear reads fine and fails every state-changing write — the batch
 // call and every per-item retry — so the run cannot apply its plan. It counts
 // the CreateIssues calls so the test can prove the per-item fallback ran and

@@ -414,6 +414,12 @@ The SQLite cache stores:
 - Snyk-side normalized hashes keyed by fingerprint
 - Linear-side normalized hashes keyed by fingerprint
 - a schema signature for the managed issue format
+- a `saved_at` timestamp for the last successful write, so the next run logs
+  the cache age; a cache written before this key existed reports its age as
+  unknown
+- cached v1 ignore metadata; `LoadIgnores` drops entries past
+  `ignoreEntryTTL` and entries whose `updated_at` cannot be parsed, counting
+  both so the refreshed-cache line reports them
 
 The cache is used only as an optimization. It should never be the only source used to infer real current state.
 
@@ -495,7 +501,7 @@ If this project grows further, the next reasonable extensions would be:
 
 - stronger incremental Snyk fetching using server timestamps where available
 - more selective Linear snapshot loading if the API surface allows it safely
-- richer cache statistics and observability
+- richer cache statistics than age and ignore-eviction counts
 - explicit conflict reporting output
 
 The current implementation is intentionally optimized for correctness first, then steady-state efficiency.

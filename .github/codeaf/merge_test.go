@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -65,8 +67,20 @@ func newTestRepo(t *testing.T) *testRepo {
 
 func (r *testRepo) tree(files map[string]string) string {
 	r.t.Helper()
-	names := make([]string, 0, len(files))
+	// Split the files into blobs at this level and subtrees below it, so
+	// tests can commit long conflicted paths (one over 255 bytes does not
+	// fit in a single directory component, but fits a nested path).
+	sub := map[string]map[string]string{}
+	var names []string
 	for name := range files {
+		if i := strings.IndexByte(name, '/'); i >= 0 {
+			dir, rest := name[:i], name[i+1:]
+			if sub[dir] == nil {
+				sub[dir] = map[string]string{}
+			}
+			sub[dir][rest] = files[name]
+			continue
+		}
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -75,7 +89,22 @@ func (r *testRepo) tree(files map[string]string) string {
 		blob := strings.TrimSpace(gitTestIn(r.t, r.dir, files[name], "hash-object", "-w", "--stdin"))
 		buf.WriteString("100644 blob " + blob + "\t" + name + "\n")
 	}
+	for _, dir := range sortedKeys(sub) {
+		buf.WriteString("040000 tree " + r.tree(sub[dir]) + "\t" + dir + "\n")
+	}
 	return strings.TrimSpace(gitTestIn(r.t, r.dir, buf.String(), "mktree"))
+}
+
+// sortedKeys returns the map keys in sorted order, so tree building is
+// deterministic (mktree normalises the order itself, but stable input keeps
+// failures readable).
+func sortedKeys(m map[string]map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (r *testRepo) commitTree(tree string, parents []string, message string) string {
@@ -482,6 +511,410 @@ func TestRunMergeDegradesWideConflictToNoMerge(t *testing.T) {
 	}
 }
 
+// Issue #33: git C-quotes a non-ASCII conflicted path in --name-only output
+// (on git 2.43, a conflict in é.txt comes back as "\303\251.txt"), so the
+// recorded merge-info path, the marker check and the brief would all name a
+// file that does not exist. mergeTree unquotes, and this walks the whole
+// chain a conflict in é.txt takes: the merge info, verifyMerge (which reads
+// the path from disk), and the brief section.
+func TestRunMergeRecordsNonASCIIConflictPathsUnquoted(t *testing.T) {
+	r := newTestRepo(t)
+	base := r.commit("base", map[string]string{"é.txt": "a\nb\nc\n"})
+	pr := r.commit("pr change", map[string]string{"é.txt": "a\npr\nc\n"}, base)
+	mainTip := r.commit("main change", map[string]string{"é.txt": "a\nbase\nc\n"}, base)
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	r.withOrigin("pr", "main")
+	baseFile, infoFile, stateFile := artifactDir(t)
+
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != mergeKindConflicted {
+		t.Fatalf("runMerge: state=%q err=%v; want conflicted", got.State, err)
+	}
+	info, err := readMergeInfo(infoFile)
+	if err != nil {
+		t.Fatalf("merge info: %v", err)
+	}
+	if !reflect.DeepEqual(info.Files, []string{"é.txt"}) {
+		t.Fatalf("merge info files = %q, want [é.txt]", info.Files)
+	}
+	if raw, err := os.ReadFile(infoFile); err != nil || strings.Contains(string(raw), `\303`) {
+		t.Fatalf("merge info records the C-quoted path: %q (%v)", raw, err)
+	}
+
+	// The marker check reads each recorded path from the working tree, which
+	// still carries the unresolved markers: it must find them in é.txt, not
+	// fail to open a quoted name that does not exist.
+	if err := writeMergeState(stateFile, got); err != nil {
+		t.Fatal(err)
+	}
+	err = verifyMerge(r.dir, stateFile)
+	// For a single file the path is named on a ::error:: line, not in the
+	// returned error; "could not read" would mean the check tried the
+	// C-quoted name, which does not exist on disk.
+	if err == nil || !strings.Contains(err.Error(), "conflict marker") || strings.Contains(err.Error(), "could not read") {
+		t.Fatalf("verifyMerge err = %v; want a marker refusal for é.txt (the file it must read)", err)
+	}
+	if marked, err := os.ReadFile(filepath.Join(r.dir, "é.txt")); err != nil || !strings.Contains(string(marked), "<<<<<<<") {
+		t.Fatalf("é.txt in the checkout carries no markers: %q (%v)", marked, err)
+	}
+
+	// The brief names the file the agent must resolve.
+	section, err := mergeBriefSection(infoFile)
+	if err != nil {
+		t.Fatalf("mergeBriefSection: %v", err)
+	}
+	if !strings.Contains(section, "é.txt") {
+		t.Fatalf("brief section lacks é.txt:\n%s", section)
+	}
+}
+
+// Issue #33: the writer must check conflicted paths the way the reader does.
+// A conflicted path usableMergePath rejects -- here one starting with "-",
+// which a later command line could take for a flag -- would be recorded into
+// a merge-info.json the reader refuses, and publish treats a merge info that
+// exists but does not validate as fatal, so every rerun would fail the same
+// way. runMerge degrades to no merge instead, with a recorded reason.
+func TestRunMergeDegradesUnusableConflictPathToNoMerge(t *testing.T) {
+	r := newTestRepo(t)
+	base := r.commit("base", map[string]string{"-flag.txt": "a\nb\nc\n"})
+	pr := r.commit("pr change", map[string]string{"-flag.txt": "a\npr\nc\n"}, base)
+	mainTip := r.commit("main change", map[string]string{"-flag.txt": "a\nbase\nc\n"}, base)
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	r.withOrigin("pr", "main")
+	baseFile, infoFile, _ := artifactDir(t)
+
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != "none" {
+		t.Fatalf("runMerge: state=%q err=%v; want none", got.State, err)
+	}
+	if r.head() != pr {
+		t.Fatal("the branch moved without a merge")
+	}
+	if _, err := os.Stat(infoFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("merge info written for a merge that was not made: %v", err)
+	}
+	runState, err := os.ReadFile(runStateFile(infoFile))
+	if err != nil {
+		t.Fatalf("no no-merge record: %v", err)
+	}
+	if !strings.Contains(string(runState), "state=none") || !strings.Contains(string(runState), "cannot name") {
+		t.Fatalf("no-merge reason = %q; want the unusable-path refusal", runState)
+	}
+}
+
+// Issue #34 security review: mergeTree unquotes git's C-quoted output, so a
+// conflicted path can carry a raw control byte -- a file named
+// "x\r::warning::forged" comes back with a raw CR, and a lone CR breaks a
+// log line: the runner treats it as a line break, so the rest of the name
+// would run as a workflow command. usableMergePath rejects every byte below
+// 0x20 and 0x7f, and runMerge applies the same check before committing, so
+// the merge degrades to no merge, with a recorded reason, instead of
+// writing a merge-info.json publish would refuse on every rerun.
+func TestRunMergeDegradesCRConflictPathToNoMerge(t *testing.T) {
+	r := newTestRepo(t)
+	name := "x\r::warning::forged"
+	base := r.commit("base", map[string]string{name: "a\nb\nc\n"})
+	pr := r.commit("pr change", map[string]string{name: "a\npr\nc\n"}, base)
+	mainTip := r.commit("main change", map[string]string{name: "a\nbase\nc\n"}, base)
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	r.withOrigin("pr", "main")
+	baseFile, infoFile, _ := artifactDir(t)
+
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != "none" {
+		t.Fatalf("runMerge: state=%q err=%v; want none", got.State, err)
+	}
+	if r.head() != pr {
+		t.Fatal("the branch moved without a merge")
+	}
+	if _, err := os.Stat(infoFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("merge info written for a merge that was not made: %v", err)
+	}
+	runState, err := os.ReadFile(runStateFile(infoFile))
+	if err != nil {
+		t.Fatalf("no no-merge record: %v", err)
+	}
+	if !strings.Contains(string(runState), "state=none") || !strings.Contains(string(runState), "cannot name") {
+		t.Fatalf("no-merge reason = %q; want the unusable-path refusal", runState)
+	}
+}
+
+// Issue #33: the 64 KB probe must size the recorded Workflows value the way
+// the write will, and the recorded value is only settled after
+// checkMergeGated -- so the probe sizes the longer literal (false, one byte
+// more than true). A merge whose info is exactly at the reader limit when
+// sized with false must degrade to no merge: sized with the shorter true it
+// would pass the probe and then write a byte over 64 KB, a merge info the
+// reader refuses and publish treats as fatal on every rerun (issue #21).
+func TestRunMergeDegradesMergeInfoAt64KBProbe(t *testing.T) {
+	r := newTestRepo(t)
+	// Conflicted paths of ~490 bytes each: 200 paths of at most 255 bytes
+	// cannot reach 64 KB, and usableMergePath rejects anything over 512.
+	names := make([]string, 130)
+	for i := range names {
+		// Two long components, both under the 255-byte per-name limit:
+		// ~488 bytes each, near what usableMergePath accepts.
+		names[i] = fmt.Sprintf("d%03d", i) + strings.Repeat("d", 240) + "/" + strings.Repeat("p", 242) + "f"
+	}
+	// The probe runMerge builds, byte for byte: same MarshalIndent form, the
+	// commit and tree ids fixed 40-hex length (real or placeholder alike).
+	probeSize := func(files []string) int {
+		probe := mergeInfo{Kind: mergeKindConflicted, Commit: strings.Repeat("0", 40), Base: strings.Repeat("b", 40), Onto: strings.Repeat("c", 40), Tree: strings.Repeat("0", 40), Files: files, Workflows: false}
+		data, err := json.MarshalIndent(probe, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(data) + 1
+	}
+	// Widen every name by the same pad until the probe is less than one
+	// byte per name under the limit, then widen one name per missing byte:
+	// one extra byte in one name is one extra byte in the record.
+	target := 1<<16 + 1 // len(data)+1 must be over the 65536 the reader accepts
+	size := probeSize(names)
+	if size > target {
+		t.Fatalf("starting names already size the probe over the limit: %d", size)
+	}
+	if step := (target - size) / len(names); step > 0 {
+		for i, n := range names {
+			names[i] = n + strings.Repeat("x", step)
+		}
+		size = probeSize(names)
+	}
+	for i := 0; i < target-size; i++ {
+		names[i] += "x"
+	}
+	for i, n := range names {
+		if len(n) > 512 {
+			t.Fatalf("name %d is %d bytes, over what usableMergePath accepts", i, len(n))
+		}
+	}
+	if got := probeSize(names); got != target {
+		t.Fatalf("probe size = %d, want exactly %d", got, target)
+	}
+	baseFiles, prFiles, mainFiles := make(map[string]string), make(map[string]string), make(map[string]string)
+	for _, n := range names {
+		baseFiles[n], prFiles[n], mainFiles[n] = "a\nb\nc\n", "a\npr\nc\n", "a\nbase\nc\n"
+	}
+	base := r.commit("base", baseFiles)
+	pr := r.commit("pr change", prFiles, base)
+	mainTip := r.commit("main change", mainFiles, base)
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	r.withOrigin("pr", "main")
+	baseFile, infoFile, _ := artifactDir(t)
+
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != "none" {
+		t.Fatalf("runMerge: state=%q err=%v; want none (a probe sized with the shorter true would have merged)", got.State, err)
+	}
+	if r.head() != pr {
+		t.Fatal("the branch moved without a merge")
+	}
+	if _, err := os.Stat(infoFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("merge info written for a merge that was not made: %v", err)
+	}
+	runState, err := os.ReadFile(runStateFile(infoFile))
+	if err != nil {
+		t.Fatalf("no no-merge record: %v", err)
+	}
+	if !strings.Contains(string(runState), "state=none") || !strings.Contains(string(runState), "64 KB") {
+		t.Fatalf("no-merge reason = %q; want the 64 KB refusal", runState)
+	}
+}
+
+// Issue #33: the no-merge reason leads with its instruction because
+// mergeNotMade caps it at 300 bytes -- a long base branch name must not be
+// able to cut "a person must merge the branch by hand" out of what the
+// agent is told.
+func TestRunMergeReasonKeepsInstructionUnderLongBaseRef(t *testing.T) {
+	r := newTestRepo(t)
+	base := r.commit("base", map[string]string{"-flag.txt": "a\nb\nc\n"})
+	pr := r.commit("pr change", map[string]string{"-flag.txt": "a\npr\nc\n"}, base)
+	mainTip := r.commit("main change", map[string]string{"-flag.txt": "a\nbase\nc\n"}, base)
+	// A base branch whose name alone pushes the reason past the cap (each
+	// path component stays under the 255-byte ref-file limit).
+	longRef := strings.Repeat("br/", 80) + "end"
+	r.setBranch("pr", pr)
+	r.setBranch(longRef, mainTip)
+	r.onBranch("pr")
+	r.withOrigin("pr", longRef)
+	baseFile, infoFile, _ := artifactDir(t)
+
+	got, err := runMerge(r.dir, "pr", longRef, baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != "none" {
+		t.Fatalf("runMerge: state=%q err=%v; want none", got.State, err)
+	}
+	runState, err := os.ReadFile(runStateFile(infoFile))
+	if err != nil {
+		t.Fatalf("no no-merge record: %v", err)
+	}
+	reason := ""
+	for _, line := range strings.Split(string(runState), "\n") {
+		if strings.HasPrefix(line, "reason=") {
+			reason = strings.TrimPrefix(line, "reason=")
+		}
+	}
+	if reason == "" {
+		t.Fatalf("no reason recorded: %q", runState)
+	}
+	if len(reason) > maxNoMergeReasonBytes {
+		t.Fatalf("reason is %d bytes, over the %d cap", len(reason), maxNoMergeReasonBytes)
+	}
+	if !strings.HasPrefix(reason, "a person must merge the branch by hand") {
+		t.Fatalf("the long base ref cut the instruction out of the reason: %q", reason)
+	}
+}
+
+// Issue #33: the conflicted-files notice is built from unquoted git paths,
+// which can carry non-ASCII bytes and control characters. It is stripped of
+// control characters (a ::notice:: line must not carry them) and capped with
+// capUTF8, so the cut cannot split a multi-byte character.
+func TestRunMergeNoticeListStripsControlAndCapsOnRuneBoundary(t *testing.T) {
+	r := newTestRepo(t)
+	baseFiles := map[string]string{
+		strings.Repeat("é", 100) + "1.txt": "a\nb\nc\n",
+		strings.Repeat("é", 100) + "2.txt": "a\nb\nc\n",
+		strings.Repeat("é", 100) + "3.txt": "a\nb\nc\n",
+	}
+	prFiles := map[string]string{
+		strings.Repeat("é", 100) + "1.txt": "a\npr\nc\n",
+		strings.Repeat("é", 100) + "2.txt": "a\npr\nc\n",
+		strings.Repeat("é", 100) + "3.txt": "a\npr\nc\n",
+	}
+	mainFiles := map[string]string{
+		strings.Repeat("é", 100) + "1.txt": "a\nbase\nc\n",
+		strings.Repeat("é", 100) + "2.txt": "a\nbase\nc\n",
+		strings.Repeat("é", 100) + "3.txt": "a\nbase\nc\n",
+	}
+	base := r.commit("base", baseFiles)
+	pr := r.commit("pr change", prFiles, base)
+	mainTip := r.commit("main change", mainFiles, base)
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	r.withOrigin("pr", "main")
+	baseFile, infoFile, _ := artifactDir(t)
+
+	// Capture the ::notice:: lines runMerge prints on stdout.
+	old := os.Stdout
+	rd, wr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = wr
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	wr.Close()
+	os.Stdout = old
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, rd); err != nil {
+		t.Fatal(err)
+	}
+	if err != nil || got.State != mergeKindConflicted {
+		t.Fatalf("runMerge: state=%q err=%v; want conflicted", got.State, err)
+	}
+	notice := buf.String()
+	if !strings.Contains(notice, "::notice::") {
+		t.Fatalf("no notice printed:\n%s", notice)
+	}
+	if !utf8.ValidString(notice) {
+		t.Fatalf("the notice is not valid UTF-8 (a cut split a character):\n%q", notice)
+	}
+	// The three long names alone are over the 400-byte cap, so the list is
+	// cut -- on a rune boundary, ending in the ellipsis. Since the issue #34
+	// tightening of usableMergePath, a conflicted path carrying a control
+	// byte never reaches this notice in a run (runMerge degrades to no merge,
+	// tested in TestRunMergeDegradesCRConflictPathToNoMerge). The stripping
+	// the list still does is a backstop, so this test also drives
+	// printConflictNotice -- the exact function runMerge calls -- with a
+	// control character in the list, and asserts it comes out gone.
+	const listMark = "CodeAF must resolve: "
+	i := strings.Index(notice, listMark)
+	if i < 0 {
+		t.Fatalf("no conflicted-file list in the notice:\n%s", notice)
+	}
+	list := notice[i+len(listMark):]
+	if len(list) > 400+3 || !strings.HasSuffix(list, "…\n") {
+		t.Fatalf("the list was not capped on a rune boundary (%d bytes):\n%q", len(list), list)
+	}
+	// The stripping the list still does is a backstop: drive
+	// printConflictNotice -- the exact function runMerge calls -- with a
+	// control character in the list and assert it comes out gone, the line
+	// still one line and the name around the stripped byte intact.
+	ctlFiles := append([]string{}, got.Files...)
+	ctlFiles[0] = "ctl\x01" + ctlFiles[0] // first: inside the 400-byte cap, so the name survives the cut
+	oldCtl := os.Stdout
+	rdCtl, wrCtl, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = wrCtl
+	printConflictNotice("pr", "0", "pr", ctlFiles)
+	wrCtl.Close()
+	os.Stdout = oldCtl
+	var ctlBuf bytes.Buffer
+	if _, err := io.Copy(&ctlBuf, rdCtl); err != nil {
+		t.Fatal(err)
+	}
+	ctlNotice := ctlBuf.String()
+	if strings.Count(ctlNotice, "\n") != 1 || !strings.HasSuffix(ctlNotice, "\n") {
+		t.Fatalf("the notice with a control character is not one line: %q", ctlNotice)
+	}
+	for _, b := range []byte(ctlNotice) {
+		if (b < 0x20 && b != '\n') || b == 0x7f {
+			t.Fatalf("the notice carries a raw control byte 0x%02x: %q", b, ctlNotice)
+		}
+	}
+	if !strings.Contains(ctlNotice, "ctl") || !strings.Contains(ctlNotice, "\u00e9") {
+		t.Fatalf("the notice lost the name around the stripped control byte: %q", ctlNotice)
+	}
+}
+
+// Issue #34 security review: the notice's conflicted-file list must never
+// carry a raw control character -- a lone CR breaks the line and the rest of
+// a name would run as a workflow command -- and the cap must not split a
+// multi-byte character.
+func TestPrintConflictNoticeStripsControlCharacters(t *testing.T) {
+	files := []string{
+		"x\r::warning::forged",
+		"ctl\x01x.txt",
+		"del\x7f.txt",
+		strings.Repeat("\u00e9", 100) + "1.txt",
+		strings.Repeat("\u00e9", 100) + "2.txt",
+	}
+	old := os.Stdout
+	rd, wr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = wr
+	printConflictNotice("main", strings.Repeat("c", 40), "pr", files)
+	wr.Close()
+	os.Stdout = old
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, rd); err != nil {
+		t.Fatal(err)
+	}
+	notice := buf.String()
+	if !strings.HasSuffix(notice, "\n") || strings.Count(notice, "\n") != 1 {
+		t.Fatalf("the notice is not exactly one line: %q", notice)
+	}
+	for _, b := range []byte(notice) {
+		if (b < 0x20 && b != '\n') || b == 0x7f {
+			t.Fatalf("the notice carries a raw control byte 0x%02x: %q", b, notice)
+		}
+	}
+	if !utf8.ValidString(notice) {
+		t.Fatalf("the notice is not valid UTF-8 (a cut split a character):\n%q", notice)
+	}
+}
+
 // ---------------------------------------------------------------- the brief
 
 func TestMergeBriefSectionNamesConflictedFiles(t *testing.T) {
@@ -560,6 +993,37 @@ func TestMergeBriefSectionNamesConflictedFiles(t *testing.T) {
 	}
 	if _, err := mergeBriefSection(path); err == nil {
 		t.Fatal("an unreadable conflicted merge must fail the brief")
+	}
+}
+
+// Issue #34 security review: a backtick in a conflicted name would end the
+// inline code span early and let the rest of the name render as brief text.
+// Such a name is listed without a code span, its backticks escaped; the
+// merge info itself keeps the real name.
+func TestMergeBriefSectionEscapesBacktickInName(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "merge-info.json")
+	info := mergeInfo{
+		Kind: mergeKindConflicted, Commit: strings.Repeat("a", 40), Base: strings.Repeat("b", 40),
+		Onto: strings.Repeat("c", 40), Tree: strings.Repeat("d", 40),
+		Files: []string{"a`b.txt"},
+	}
+	data, err := json.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	section, err := mergeBriefSection(path)
+	if err != nil {
+		t.Fatalf("mergeBriefSection: %v", err)
+	}
+	if !strings.Contains(section, "- a\\`b.txt\n") {
+		t.Fatalf("the backtick name is not listed escaped:\n%s", section)
+	}
+	if strings.Contains(section, "`a`b") {
+		t.Fatalf("the backtick name breaks out of a code span:\n%s", section)
 	}
 }
 
@@ -1087,6 +1551,51 @@ func TestVerifyRefusesLeftoverMarkers(t *testing.T) {
 	}
 }
 
+// Issue #34 security review: a conflicted path carrying a raw CR must never
+// reach a ::error:: line -- the runner treats a lone CR as a line break, so
+// the rest of the name would run as a workflow command. verifyMerge refuses
+// the path (one line, the CR escaped by %q), and the marker message itself
+// is printed stripped of control characters as a backstop.
+func TestVerifyMergeNeverPrintsRawControlPath(t *testing.T) {
+	dir := t.TempDir()
+	stateFile := filepath.Join(dir, "state.env")
+	name := "x\r::warning::x"
+	if err := os.WriteFile(filepath.Join(dir, name), []byte("<<<<<<< pr\npr\n=======\nmain\n>>>>>>> main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stateFile, []byte("state=conflicted\nmerged=true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stateFile+".files", []byte(name+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdout
+	rd, wr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = wr
+	err = verifyMerge(dir, stateFile)
+	wr.Close()
+	os.Stdout = old
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, rd); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if err == nil {
+		t.Fatal("verifyMerge accepted a conflicted path with a raw CR")
+	}
+	for label, s := range map[string]string{"stdout": out, "error": err.Error()} {
+		if strings.ContainsAny(s, "\r\x00") || strings.Count(s, "\n") > 1 {
+			t.Fatalf("verifyMerge %s carries a raw CR or more than one line: %q", label, s)
+		}
+	}
+	if !strings.Contains(err.Error(), `x\r::warning::x`) {
+		t.Fatalf("the refusal does not quote the path with the CR escaped: %q", err)
+	}
+}
+
 func TestFindConflictMarker(t *testing.T) {
 	cases := map[string]bool{
 		"<<<<<<< HEAD\n":      true,
@@ -1139,6 +1648,11 @@ func TestReadMergeInfoValidation(t *testing.T) {
 		"path escape":   {Kind: mergeKindConflicted, Commit: good.Commit, Base: good.Base, Onto: good.Onto, Tree: good.Tree, Files: []string{"../f.txt"}},
 		"absolute path": {Kind: mergeKindConflicted, Commit: good.Commit, Base: good.Base, Onto: good.Onto, Tree: good.Tree, Files: []string{"/etc/passwd"}},
 		"newline path":  {Kind: mergeKindConflicted, Commit: good.Commit, Base: good.Base, Onto: good.Onto, Tree: good.Tree, Files: []string{"a\nb"}},
+		// A raw CR or TAB in a recorded path would forge a workflow command
+		// in a ::error:: line (issue #34): every byte below 0x20, and 0x7f,
+		// is refused, on the reader side as on the writer's.
+		"cr path":  {Kind: mergeKindConflicted, Commit: good.Commit, Base: good.Base, Onto: good.Onto, Tree: good.Tree, Files: []string{"x\r::warning::forged"}},
+		"tab path": {Kind: mergeKindConflicted, Commit: good.Commit, Base: good.Base, Onto: good.Onto, Tree: good.Tree, Files: []string{"x\ty"}},
 	}
 	for name, info := range cases {
 		data, _ := json.Marshal(info)

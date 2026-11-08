@@ -458,6 +458,30 @@ func TestMergeBriefSectionNamesConflictedFiles(t *testing.T) {
 		t.Fatalf("clean section = %q", section)
 	}
 
+	// A merge carrying the base branch's workflow changes (issue #16) says
+	// that publishing waits for a maintainer's approval.
+	info.Workflows = true
+	info.Kind = mergeKindClean
+	data, _ = json.Marshal(info)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	section, err = mergeBriefSection(path)
+	if err != nil {
+		t.Fatalf("mergeBriefSection: %v", err)
+	}
+	if !strings.Contains(section, "maintainer") {
+		t.Fatalf("workflows-carrying merge section lacks the approval note:\n%s", section)
+	}
+	info.Workflows = false
+	data, _ = json.Marshal(info)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if section, err = mergeBriefSection(path); err != nil || strings.Contains(section, "maintainer") {
+		t.Fatalf("plain merge section mentions approval: %q (%v)", section, err)
+	}
+
 	// No merge info is the normal case: an empty section, no error.
 	if section, err := mergeBriefSection(filepath.Join(dir, "absent.json")); err != nil || section != "" {
 		t.Fatalf("absent merge info: section=%q err=%v", section, err)
@@ -470,6 +494,108 @@ func TestMergeBriefSectionNamesConflictedFiles(t *testing.T) {
 	}
 	if _, err := mergeBriefSection(path); err == nil {
 		t.Fatal("an unreadable conflicted merge must fail the brief")
+	}
+}
+
+// Issue #16: when the run job could not merge the base branch, the brief says
+// so plainly and tells the agent not to merge or copy the base by hand --
+// publish refuses an unverifiable replay of the base's changes (issue #171).
+func TestMergeBriefSectionNoMergeReason(t *testing.T) {
+	dir := t.TempDir()
+	infoPath := filepath.Join(dir, "merge-info.json")
+	runPath := runStateFile(infoPath)
+
+	// No merge info and no run record: the brief says nothing, as before.
+	if section, err := mergeBriefSection(infoPath); err != nil || section != "" {
+		t.Fatalf("absent both: section=%q err=%v", section, err)
+	}
+
+	// A recorded no-merge reason: the brief names it, forbids a hand merge
+	// and asks the run to report the PR still needs to catch up.
+	if err := os.WriteFile(runPath, []byte("state=none\nreason=the base branch main could not be fetched: exit 128\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	section, err := mergeBriefSection(infoPath)
+	if err != nil {
+		t.Fatalf("mergeBriefSection: %v", err)
+	}
+	for _, want := range []string{"not merged", "could not be fetched", "Do not merge", "catch up with its base branch"} {
+		if !strings.Contains(section, want) {
+			t.Fatalf("no-merge section lacks %q:\n%s", want, section)
+		}
+	}
+
+	// An empty reason (the base was already contained) says nothing.
+	if err := os.WriteFile(runPath, []byte("state=none\nreason=\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if section, err := mergeBriefSection(infoPath); err != nil || section != "" {
+		t.Fatalf("empty reason: section=%q err=%v", section, err)
+	}
+
+	// The record is run-job output, so untrusted: a reason is re-bounded and
+	// stripped of control characters, whatever the file says.
+	big := strings.Repeat("x", 500) + "\nnewline\n"
+	if err := os.WriteFile(runPath, []byte("state=none\nreason="+big+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	section, err = mergeBriefSection(infoPath)
+	if err != nil {
+		t.Fatalf("mergeBriefSection: %v", err)
+	}
+	if i := strings.Index(section, "("); i >= 0 {
+		if j := strings.Index(section[i:], ")"); j >= 0 {
+			reason := section[i+1 : i+j]
+			if len(reason) > 300 {
+				t.Fatalf("reason not bounded: %d characters", len(reason))
+			}
+			if strings.ContainsFunc(reason, func(r rune) bool { return r < 32 || r == 127 }) {
+				t.Fatalf("reason carries raw control characters: %q", reason)
+			}
+		} else {
+			t.Fatalf("no closing paren for the reason: %q", section)
+		}
+	} else {
+		t.Fatal("no reason in the section:\n" + section)
+	}
+}
+
+// Issue #16: the run job's packaging step reads the workflows field through
+// the harness binary. A missing file reads false; an invalid one is an error,
+// never a silent false; a recorded one routes publish into the
+// approval-gated environment.
+func TestMergeWorkflowsRouting(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "merge-info.json")
+
+	if routed, err := mergeWorkflowsRouting(filepath.Join(dir, "absent.json")); err != nil || routed {
+		t.Fatalf("absent merge info: routed=%t err=%v", routed, err)
+	}
+
+	info := mergeInfo{Kind: mergeKindClean, Commit: strings.Repeat("a", 40), Base: strings.Repeat("b", 40),
+		Onto: strings.Repeat("c", 40), Tree: strings.Repeat("d", 40)}
+	data, _ := json.Marshal(info)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if routed, err := mergeWorkflowsRouting(path); err != nil || routed {
+		t.Fatalf("plain merge info: routed=%t err=%v", routed, err)
+	}
+
+	info.Workflows = true
+	data, _ = json.Marshal(info)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if routed, err := mergeWorkflowsRouting(path); err != nil || !routed {
+		t.Fatalf("workflows merge info: routed=%t err=%v", routed, err)
+	}
+
+	if err := os.WriteFile(path, []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mergeWorkflowsRouting(path); err == nil {
+		t.Fatal("an invalid merge info must error, not read false")
 	}
 }
 
@@ -855,6 +981,17 @@ func TestReadMergeInfoValidation(t *testing.T) {
 	if info, err := readMergeInfo(path); err != nil || info.Kind != mergeKindConflicted {
 		t.Fatalf("readMergeInfo: %+v %v", info, err)
 	}
+	// The workflows field (issue #16) is a bounded boolean like the rest.
+	good.Workflows = true
+	data, _ = json.Marshal(good)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := readMergeInfo(path); err != nil || !info.Workflows {
+		t.Fatalf("readMergeInfo: %+v %v; want workflows: true read back", info, err)
+	}
+	good.Workflows = false
+	data, _ = json.Marshal(good)
 
 	cases := map[string]mergeInfo{
 		"unknown kind":  {Kind: "weird", Commit: good.Commit, Base: good.Base, Onto: good.Onto, Tree: good.Tree},
@@ -980,49 +1117,684 @@ func TestConflictedMergeRoundTrip(t *testing.T) {
 // brought in: GitHub refuses a GITHUB_TOKEN push that carries workflow
 // changes, so the run proceeds on the bare head and publish pushes the patch
 // alone, as before #57.
-func TestMergeSkipsWorkflowChanges(t *testing.T) {
+// divergedWorkflow builds the issue #16 shape: two branches off one base that
+// conflict in f.txt, where main also changed .github/workflows/ci.yml since
+// the branch point. workflowOnlyMain changes disjoint files instead, so the
+// merge is clean, and prWorkflowEdit has the PR branch edit a workflow file
+// of its own (which must travel in the patch, never in the merge).
+func divergedWorkflow(t *testing.T) (*testRepo, string, string, string) {
+	t.Helper()
 	r := newTestRepo(t)
-	base := r.commit("base", map[string]string{"f.txt": "a\n"})
-	pr := r.commit("pr change", map[string]string{"f.txt": "a\npr\n"}, base)
-	// mktree takes no nested paths, so this commit is built through an index.
-	index := filepath.Join(t.TempDir(), "index")
-	blob := func(content string) string {
-		return strings.TrimSpace(gitTestIn(t, r.dir, content, "hash-object", "-w", "--stdin"))
+	base := r.commit("base", map[string]string{"f.txt": "a\nb\nc\n", "g.txt": "x\n"})
+	pr := r.commit("pr change", map[string]string{"f.txt": "a\nB\nc\n", "g.txt": "x\npr\n"}, base)
+	mainTip := r.commitTree(r.indexTree(map[string]string{
+		"f.txt":                    "a\nb\nC\n",
+		"g.txt":                    "x\n",
+		".github/workflows/ci.yml": "on: push\n",
+	}), []string{base}, "main changes a workflow and f.txt")
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	return r, base, pr, mainTip
+}
+
+// Issue #16, run side: the base branch changed .github/workflows/ and
+// conflicts with the branch. The merge is made anyway -- a conflicted merge
+// commit -- and recorded with "workflows": true, instead of the old skip that
+// left #10 unable to catch up with main.
+func TestRunMergeCarriesBaseWorkflowChanges(t *testing.T) {
+	r, _, pr, mainTip := divergedWorkflow(t)
+	// The merge base is fetched from origin, one level deep, as in production.
+	origin := r.withOrigin("pr", "main")
+	_ = origin
+	baseFile, infoFile, stateFile := artifactDir(t)
+
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil {
+		t.Fatalf("runMerge: %v", err)
 	}
-	env := func(args ...string) string {
-		cmd := exec.Command("git", args...)
-		cmd.Dir = r.dir
-		cmd.Env = append(os.Environ(), "GIT_INDEX_FILE="+index)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %v: %s", args, err, out)
+	if got.State != mergeKindConflicted {
+		t.Fatalf("state = %q, want a conflicted merge despite the workflow change", got.State)
+	}
+	head := r.head()
+	if parents := gitTest(t, r.dir, "log", "--format=%P", "-1", head); strings.Fields(parents)[0] != pr || strings.Fields(parents)[1] != mainTip {
+		t.Fatalf("merge parents = %s, want [%s %s]", parents, pr, mainTip)
+	}
+	if base, err := os.ReadFile(baseFile); err != nil || strings.TrimSpace(string(base)) != head {
+		t.Fatalf("base commit file = %q, %v; want the merge commit %s", base, err, head)
+	}
+	info, err := readMergeInfo(infoFile)
+	if err != nil {
+		t.Fatalf("readMergeInfo: %v", err)
+	}
+	if !info.Workflows {
+		t.Fatal("merge info does not record workflows: true")
+	}
+	if info.Kind != mergeKindConflicted || !strings.Contains(strings.Join(info.Files, ","), "f.txt") {
+		t.Fatalf("merge info = %+v; want kind conflicted conflicting in f.txt", info)
+	}
+	if info.Tree != got.Tree {
+		t.Fatalf("recorded tree %s, want %s", info.Tree, got.Tree)
+	}
+	_ = stateFile
+}
+
+// Issue #16, publish side, approved: with the run's merge info and
+// HARNESS_APPROVED=true, publish recreates the merge -- the tree hash it
+// computes matches the recorded one, and the merge's .github/workflows/
+// equals the base branch's byte-for-byte.
+func TestPublishApprovedWorkflowsMerge(t *testing.T) {
+	r, _, pr, mainTip := divergedWorkflow(t)
+	origin := r.withOrigin("pr", "main")
+	baseFile, infoFile, stateFile := artifactDir(t)
+
+	if _, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r)); err != nil {
+		t.Fatalf("runMerge: %v", err)
+	}
+	info, err := readMergeInfo(infoFile)
+	if err != nil || !info.Workflows {
+		t.Fatalf("readMergeInfo = %+v, %v; want workflows recorded", info, err)
+	}
+	pub := publishCheckout(t, origin, "pr")
+	t.Setenv("HARNESS_APPROVED", "true")
+	got, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r))
+	if err != nil {
+		t.Fatalf("publishMerge: %v", err)
+	}
+	if got.State != mergeKindConflicted || got.Tree != info.Tree {
+		t.Fatalf("state = %q tree %s; want a conflicted merge with tree %s verified", got.State, got.Tree, info.Tree)
+	}
+	head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD"))
+	if parents := gitTest(t, pub, "log", "--format=%P", "-1", head); strings.Fields(parents)[0] != pr || strings.Fields(parents)[1] != mainTip {
+		t.Fatalf("recreated merge parents = %s, want [%s %s]", parents, pr, mainTip)
+	}
+	if wf := gitTest(t, pub, "cat-file", "blob", head+":.github/workflows/ci.yml"); wf != "on: push\n" {
+		t.Fatalf("merge ci.yml = %q, want the base branch's", wf)
+	}
+	if wf, err := workflowChanges(pub, head, mainTip); err != nil || len(wf) != 0 {
+		t.Fatalf("workflowChanges(merge, base) = %q, %v; want none", wf, err)
+	}
+}
+
+// Issue #16: without a maintainer's approval, a recorded merge carrying
+// workflow changes is refused with an error naming the approval -- never
+// published as the patch alone, which is how #10 got stuck.
+func TestPublishRefusesUnapprovedWorkflowsMerge(t *testing.T) {
+	r, _, pr, _ := divergedWorkflow(t)
+	origin := r.withOrigin("pr", "main")
+	baseFile, infoFile, stateFile := artifactDir(t)
+
+	if _, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r)); err != nil {
+		t.Fatalf("runMerge: %v", err)
+	}
+	pub := publishCheckout(t, origin, "pr")
+	t.Setenv("HARNESS_APPROVED", "false")
+	if _, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r)); err == nil || !strings.Contains(err.Error(), "maintainer") {
+		t.Fatalf("publishMerge = %v; want an error naming the maintainer approval", err)
+	}
+	if head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD")); head != pr {
+		t.Fatalf("publish head = %s, want the untouched branch %s", head, pr)
+	}
+}
+
+// overlappingWorkflow builds the round-3 shape: the branch and its base both
+// edit .github/workflows/ci.yml, in different places, and main also adds
+// f.txt. The merged ci.yml would be content neither side has, so the merge
+// is not made at all (issue #16) -- publish would refuse it even with a
+// maintainer's approval, and every later run would lose its work.
+func overlappingWorkflow(t *testing.T) (*testRepo, string, string, string) {
+	t.Helper()
+	r := newTestRepo(t)
+	base := r.commitTree(r.indexTree(map[string]string{
+		"g.txt":                    "x\n",
+		".github/workflows/ci.yml": "a\nb\nc\nd\n",
+	}), nil, "base")
+	pr := r.commitTree(r.indexTree(map[string]string{
+		"g.txt":                    "x\npr\n",
+		".github/workflows/ci.yml": "A\nb\nc\nd\n",
+	}), []string{base}, "pr edits g.txt and the top of ci.yml")
+	mainTip := r.commitTree(r.indexTree(map[string]string{
+		"f.txt":                    "main\n",
+		"g.txt":                    "x\n",
+		".github/workflows/ci.yml": "a\nb\nc\nD\n",
+	}), []string{base}, "main adds f.txt and edits the bottom of ci.yml")
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	return r, base, pr, mainTip
+}
+
+// Issue #16, round 3, run side: a workflow file the base changed that the
+// branch also edits is not merged. The run proceeds on the bare head,
+// records why (the brief names the files and says a person must merge by
+// hand), and publish pushes the patch alone as before.
+func TestRunMergeSkipsOverlappingWorkflowEdits(t *testing.T) {
+	r, _, pr, _ := overlappingWorkflow(t)
+	_ = r.withOrigin("pr", "main")
+	baseFile, infoFile, stateFile := artifactDir(t)
+
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != "none" {
+		t.Fatalf("runMerge = %+v, %v; want no merge", got, err)
+	}
+	if _, err := os.Stat(infoFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("merge info written for an overlapping branch: %v", err)
+	}
+	if _, err := os.Stat(baseFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("base commit rewritten for an overlapping branch: %v", err)
+	}
+	if head := r.head(); head != pr {
+		t.Fatalf("head = %s, want the untouched branch %s", head, pr)
+	}
+	reason, err := os.ReadFile(runStateFile(infoFile))
+	if err != nil || !strings.Contains(string(reason), "ci.yml") || !strings.Contains(string(reason), "a person must merge it by hand") {
+		t.Fatalf("no-merge record = %q, %v; want the overlapping file and the by-hand instruction", reason, err)
+	}
+	_ = stateFile
+}
+
+// Issue #16, round 3: the same branch through the diverged fallback (no
+// merge info). The overlap is not merged there either: the patch goes alone,
+// whatever the approval said.
+func TestPublishFallbackSkipsOverlappingWorkflowEdits(t *testing.T) {
+	r, _, pr, _ := overlappingWorkflow(t)
+	origin := r.withOrigin("pr", "main")
+
+	baseFile, _, stateFile := artifactDir(t)
+	if err := os.WriteFile(baseFile, []byte(pr+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	infoFile := filepath.Join(t.TempDir(), "absent.json")
+	for _, approved := range []string{"false", "true"} {
+		t.Setenv("HARNESS_APPROVED", approved)
+		pub := publishCheckout(t, origin, "pr")
+		got, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r))
+		if err != nil || got.State != "none" {
+			t.Fatalf("publishMerge (approved=%s) = %+v, %v; want the patch alone, no error", approved, got, err)
 		}
-		return strings.TrimSpace(string(out))
+		if head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD")); head != pr {
+			t.Fatalf("publish head = %s, want the untouched branch %s", head, pr)
+		}
 	}
-	env("update-index", "--add", "--cacheinfo", "100644,"+blob("a\n")+",f.txt")
-	env("update-index", "--add", "--cacheinfo", "100644,"+blob("on: push\n")+",.github/workflows/ci.yml")
-	mainTip := r.commitTree(env("write-tree"), []string{base}, "main changes a workflow")
+}
+
+// Issue #16, follow-up: a PR branch with a workflow edit of its own, whose
+// base changed no workflow since the branch point, publishes a clean merge
+// with no approval. The merge info honestly records "workflows": false, the
+// recomputed carry check over the merge base finds nothing, and the per-path
+// byte check has no workflow path changed relative to the head to look at;
+// the branch's own edit is kept.
+func TestPublishKeepsBranchWorkflowEditsWithMergeInfo(t *testing.T) {
+	r, pr, mainTip := prOwnWorkflowNonWorkflowBase(t)
+	origin := r.withOrigin("pr", "main")
+	baseFile, infoFile, stateFile := artifactDir(t)
+
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != mergeKindClean {
+		t.Fatalf("runMerge = %+v, %v; want a clean merge", got, err)
+	}
+	info, err := readMergeInfo(infoFile)
+	if err != nil || info.Workflows {
+		t.Fatalf("readMergeInfo = %+v, %v; want workflows false", info, err)
+	}
+	pub := publishCheckout(t, origin, "pr")
+	got, err = publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r))
+	if err != nil || got.State != mergeKindClean {
+		t.Fatalf("publishMerge = %+v, %v; want a clean merge with no approval", got, err)
+	}
+	head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD"))
+	if parents := gitTest(t, pub, "log", "--format=%P", "-1", head); strings.Fields(parents)[0] != pr || strings.Fields(parents)[1] != mainTip {
+		t.Fatalf("merge parents = %s, want [%s %s]", parents, pr, mainTip)
+	}
+	if wf := gitTest(t, pub, "cat-file", "blob", head+":.github/workflows/pr.yml"); wf != "on: pull_request\n" {
+		t.Fatalf("merge pr.yml = %q, want the branch's own edit kept", wf)
+	}
+}
+
+// Issue #16, follow-up: the same branch through the diverged fallback (no
+// merge info): the base changed no workflow, so the fallback merges without
+// an approval, and the per-path byte check finds no workflow path changed
+// relative to the head.
+func TestPublishKeepsBranchWorkflowEditsFallback(t *testing.T) {
+	r, pr, mainTip := prOwnWorkflowNonWorkflowBase(t)
+	origin := r.withOrigin("pr", "main")
+
+	baseFile, _, stateFile := artifactDir(t)
+	if err := os.WriteFile(baseFile, []byte(pr+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	infoFile := filepath.Join(t.TempDir(), "absent.json")
+	pub := publishCheckout(t, origin, "pr")
+	got, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r))
+	if err != nil || got.State != mergeKindClean {
+		t.Fatalf("publishMerge = %+v, %v; want a clean merge with no approval", got, err)
+	}
+	head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD"))
+	if parents := gitTest(t, pub, "log", "--format=%P", "-1", head); strings.Fields(parents)[0] != pr || strings.Fields(parents)[1] != mainTip {
+		t.Fatalf("merge parents = %s, want [%s %s]", parents, pr, mainTip)
+	}
+	if wf := gitTest(t, pub, "cat-file", "blob", head+":.github/workflows/pr.yml"); wf != "on: pull_request\n" {
+		t.Fatalf("merge pr.yml = %q, want the branch's own edit kept", wf)
+	}
+}
+
+// prOwnWorkflowNonWorkflowBase builds the follow-up shape: a PR branch that
+// edits g.txt and adds a workflow file of its own, over a base whose tip
+// changed a non-workflow file only.
+func prOwnWorkflowNonWorkflowBase(t *testing.T) (*testRepo, string, string) {
+	t.Helper()
+	r := newTestRepo(t)
+	base := r.commit("base", map[string]string{"f.txt": "a\n", "g.txt": "x\n"})
+	pr := r.commitTree(r.indexTree(map[string]string{
+		"f.txt":                    "a\n",
+		"g.txt":                    "x\npr\n",
+		".github/workflows/pr.yml": "on: pull_request\n",
+	}), []string{base}, "pr edits g.txt and adds its own workflow")
+	mainTip := r.commitTree(r.indexTree(map[string]string{
+		"f.txt": "A\n",
+		"g.txt": "x\n",
+	}), []string{base}, "main changes f.txt only")
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	return r, pr, mainTip
+}
+
+// Issue #16, follow-up: a PR that edits .github/workflows/a.yml while its
+// base changed a different b.yml does carry the base's b.yml change, so
+// publishing the merge needs the maintainer's approval -- and with it the
+// merge goes through, keeping the branch's own a.yml and taking the base's
+// b.yml byte-for-byte.
+func TestPublishDifferentWorkflowFilesNeedsApproval(t *testing.T) {
+	r := newTestRepo(t)
+	base := r.commitTree(r.indexTree(map[string]string{
+		"f.txt":                   "a\n",
+		".github/workflows/a.yml": "a: 1\n",
+		".github/workflows/b.yml": "b: 1\n",
+	}), nil, "base")
+	pr := r.commitTree(r.indexTree(map[string]string{
+		"f.txt":                   "a\n",
+		".github/workflows/a.yml": "a: 2\n",
+		".github/workflows/b.yml": "b: 1\n",
+	}), []string{base}, "pr edits a.yml")
+	mainTip := r.commitTree(r.indexTree(map[string]string{
+		"f.txt":                   "A\n",
+		".github/workflows/a.yml": "a: 1\n",
+		".github/workflows/b.yml": "b: 2\n",
+	}), []string{base}, "main changes f.txt and b.yml")
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	origin := r.withOrigin("pr", "main")
+	baseFile, infoFile, stateFile := artifactDir(t)
+
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != mergeKindClean {
+		t.Fatalf("runMerge = %+v, %v; want a clean merge", got, err)
+	}
+	if info, err := readMergeInfo(infoFile); err != nil || !info.Workflows {
+		t.Fatalf("readMergeInfo = %+v, %v; want workflows true", info, err)
+	}
+	pub := publishCheckout(t, origin, "pr")
+	// Without an approval: refused, naming the maintainer approval.
+	t.Setenv("HARNESS_APPROVED", "false")
+	if _, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r)); err == nil || !strings.Contains(err.Error(), "maintainer") {
+		t.Fatalf("publishMerge (unapproved) = %v; want an error naming the maintainer approval", err)
+	}
+	// With the approval: published, with the branch's a.yml and the base's
+	// b.yml.
+	t.Setenv("HARNESS_APPROVED", "true")
+	got, err = publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r))
+	if err != nil || got.State != mergeKindClean {
+		t.Fatalf("publishMerge (approved) = %+v, %v; want a clean merge", got, err)
+	}
+	head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD"))
+	if wf := gitTest(t, pub, "cat-file", "blob", head+":.github/workflows/a.yml"); wf != "a: 2\n" {
+		t.Fatalf("merge a.yml = %q, want the branch's own edit kept", wf)
+	}
+	if wf := gitTest(t, pub, "cat-file", "blob", head+":.github/workflows/b.yml"); wf != "b: 2\n" {
+		t.Fatalf("merge b.yml = %q, want the base's byte-for-byte", wf)
+	}
+}
+
+// Issue #16, follow-up: a workflow file the base deleted counts in the
+// per-path byte check too. The merge deletes it relative to the head, and
+// the deletion compares equal to the merged-in commit's absence, so an
+// approved publish goes through with the file gone.
+func TestPublishApprovedWorkflowDeletion(t *testing.T) {
+	r := newTestRepo(t)
+	base := r.commitTree(r.indexTree(map[string]string{
+		"f.txt":                     "a\n",
+		"g.txt":                     "x\n",
+		".github/workflows/old.yml": "old: 1\n",
+	}), nil, "base")
+	pr := r.commitTree(r.indexTree(map[string]string{
+		"f.txt":                     "a\n",
+		"g.txt":                     "x\npr\n",
+		".github/workflows/old.yml": "old: 1\n",
+	}), []string{base}, "pr edits g.txt")
+	mainTip := r.commitTree(r.indexTree(map[string]string{
+		"f.txt": "A\n",
+		"g.txt": "x\n",
+	}), []string{base}, "main changes f.txt and deletes old.yml")
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	origin := r.withOrigin("pr", "main")
+	baseFile, infoFile, stateFile := artifactDir(t)
+
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != mergeKindClean {
+		t.Fatalf("runMerge = %+v, %v; want a clean merge", got, err)
+	}
+	pub := publishCheckout(t, origin, "pr")
+	t.Setenv("HARNESS_APPROVED", "true")
+	if got, err = publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r)); err != nil || got.State != mergeKindClean {
+		t.Fatalf("publishMerge = %+v, %v; want a clean merge with the deletion carried", got, err)
+	}
+	head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD"))
+	if wf := gitTest(t, pub, "ls-tree", "--name-only", head, "--", ".github/workflows/"); wf != "" {
+		t.Fatalf("merge workflows = %q, want old.yml deleted as the base did", wf)
+	}
+}
+
+// Issue #16, the fallback publish (no merge info): without approval the base
+// is still not brought in when it changed workflows -- the patch alone is
+// pushed, as before. With approval, the merge goes through.
+func TestPublishWithoutMergeInfoWorkflowsMerge(t *testing.T) {
+	r := newTestRepo(t)
+	base := r.commit("base", map[string]string{"f.txt": "a\n", "g.txt": "x\n"})
+	pr := r.commit("pr change", map[string]string{"f.txt": "a\n", "g.txt": "x\npr\n"}, base)
+	mainTip := r.commitTree(r.indexTree(map[string]string{
+		"f.txt":                    "a\n",
+		"g.txt":                    "x\n",
+		"h.txt":                    "new\n",
+		".github/workflows/ci.yml": "on: push\n",
+	}), []string{base}, "main changes a workflow")
 	r.setBranch("pr", pr)
 	r.setBranch("main", mainTip)
 	r.onBranch("pr")
 	origin := r.withOrigin("pr", "main")
 
-	baseFile, infoFile, stateFile := artifactDir(t)
-	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
-	if err != nil || got.State != "none" || r.head() != pr {
-		t.Fatalf("runMerge = %+v, %v (head %s); want no merge on %s", got, err, r.head(), pr)
-	}
-
+	baseFile, _, stateFile := artifactDir(t)
 	if err := os.WriteFile(baseFile, []byte(pr+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	infoFile := filepath.Join(t.TempDir(), "absent.json")
+
+	// Without approval: the patch alone, the branch untouched.
 	pub := publishCheckout(t, origin, "pr")
-	got, err = publishMerge(pub, "pr", "main", baseFile, filepath.Join(t.TempDir(), "absent.json"), stateFile, "", dagCompare(r))
+	got, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r))
 	if err != nil || got.State != "none" {
-		t.Fatalf("publishMerge = %+v, %v; want no merge", got, err)
+		t.Fatalf("publishMerge = %+v, %v; want no merge without approval", got, err)
 	}
 	if head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD")); head != pr {
 		t.Fatalf("publish head = %s, want the untouched branch %s", head, pr)
+	}
+
+	// With approval: the base comes in as a two-parent merge commit.
+	t.Setenv("HARNESS_APPROVED", "true")
+	got, err = publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r))
+	if err != nil || got.State != mergeKindClean {
+		t.Fatalf("publishMerge (approved) = %+v, %v; want a clean merge", got, err)
+	}
+	head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD"))
+	if parents := gitTest(t, pub, "log", "--format=%P", "-1", head); strings.Fields(parents)[0] != pr || strings.Fields(parents)[1] != mainTip {
+		t.Fatalf("merge parents = %s, want [%s %s]", parents, pr, mainTip)
+	}
+	if wf := gitTest(t, pub, "cat-file", "blob", head+":.github/workflows/ci.yml"); wf != "on: push\n" {
+		t.Fatalf("merge ci.yml = %q, want the base branch's", wf)
+	}
+}
+
+// Issue #16, security review: merge-info.json comes from the run job, so it
+// is untrusted. A run that recorded "workflows": false for a merge that does
+// carry the base's workflow changes is refused -- without an approval, and
+// even with one: the run lied about its merge.
+func TestPublishRefusesUntruthfulWorkflowsFlag(t *testing.T) {
+	r, _, pr, _ := divergedWorkflow(t)
+	origin := r.withOrigin("pr", "main")
+	baseFile, infoFile, stateFile := artifactDir(t)
+
+	if _, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r)); err != nil {
+		t.Fatalf("runMerge: %v", err)
+	}
+	info, err := readMergeInfo(infoFile)
+	if err != nil || !info.Workflows {
+		t.Fatalf("readMergeInfo = %+v, %v; want workflows recorded", info, err)
+	}
+	// The run records workflows: false for a merge that carries them.
+	info.Workflows = false
+	data, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(infoFile, append(data, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pub := publishCheckout(t, origin, "pr")
+
+	// Without an approval: refused.
+	if _, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r)); err == nil || !strings.Contains(err.Error(), "lied about its merge") {
+		t.Fatalf("publishMerge (unapproved) = %v; want a refusal naming the run's lie", err)
+	}
+	// With an approval: still refused -- the flag cannot be rehabilitated after
+	// the fact, and nothing else the run recorded is trusted either.
+	t.Setenv("HARNESS_APPROVED", "true")
+	if _, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r)); err == nil || !strings.Contains(err.Error(), "lied about its merge") {
+		t.Fatalf("publishMerge (approved) = %v; want a refusal naming the run's lie", err)
+	}
+	if head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD")); head != pr {
+		t.Fatalf("publish head = %s, want the untouched branch %s", head, pr)
+	}
+}
+
+// Issue #16, security review: the byte check compares the recreated merge's
+// .github/workflows/ with the recorded base tip the merge actually merged in
+// (info.Onto), not the base branch's current tip -- which may have moved on
+// since the run without touching what the run merged.
+func TestPublishWorkflowsByteCheckUsesRecordedBaseTip(t *testing.T) {
+	r, _, _, mainTip := divergedWorkflow(t)
+	origin := r.withOrigin("pr", "main")
+	baseFile, infoFile, stateFile := artifactDir(t)
+
+	// The run merges main as it is when the run starts.
+	if _, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r)); err != nil {
+		t.Fatalf("runMerge: %v", err)
+	}
+	info, err := readMergeInfo(infoFile)
+	if err != nil || !info.Workflows || info.Onto != mainTip {
+		t.Fatalf("readMergeInfo = %+v, %v; want the recorded tip %s", info, err, mainTip)
+	}
+	// The base branch then moves past the recorded tip, changing the
+	// workflow file the run merged in.
+	movedTip := r.commitTree(r.indexTree(map[string]string{
+		"f.txt":                    "a\nb\nC\n",
+		"g.txt":                    "x\n",
+		".github/workflows/ci.yml": "on: push\non: schedule\n",
+	}), []string{mainTip}, "main changes the workflow again")
+	r.setBranch("main", movedTip)
+	gitTest(t, r.dir, "push", "-q", origin, "refs/heads/main:refs/heads/main")
+	pub := publishCheckout(t, origin, "pr")
+	t.Setenv("HARNESS_APPROVED", "true")
+	got, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r))
+	if err != nil {
+		t.Fatalf("publishMerge: %v", err)
+	}
+	if got.Tree != info.Tree {
+		t.Fatalf("tree %s, want the recorded %s", got.Tree, info.Tree)
+	}
+	head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD"))
+	if wf := gitTest(t, pub, "cat-file", "blob", head+":.github/workflows/ci.yml"); wf != "on: push\n" {
+		t.Fatalf("merge ci.yml = %q, want the recorded base tip's byte-for-byte", wf)
+	}
+}
+
+// followedRename builds the shape the unconditional byte check exists for
+// (round 3): the branch moves tmpl/x.yml to .github/workflows/x.yml, and the
+// base then edits tmpl/x.yml at the old path. merge-ort follows the rename,
+// so the merge changes .github/workflows/x.yml relative to the head, while
+// the merge-base..onto range -- what the carry recomputation compares --
+// has no workflow path at all. main also adds f.txt, so the branches
+// diverge.
+func followedRename(t *testing.T) (*testRepo, string, string, string) {
+	t.Helper()
+	r := newTestRepo(t)
+	base := r.commitTree(r.indexTree(map[string]string{
+		"g.txt":      "x\n",
+		"tmpl/x.yml": "orig\n",
+	}), nil, "base")
+	pr := r.commitTree(r.indexTree(map[string]string{
+		"g.txt":                   "x\npr\n",
+		".github/workflows/x.yml": "orig\n",
+	}), []string{base}, "pr renames tmpl/x.yml into .github/workflows/")
+	mainTip := r.commitTree(r.indexTree(map[string]string{
+		"f.txt":      "main\n",
+		"g.txt":      "x\n",
+		"tmpl/x.yml": "edited by main\n",
+	}), []string{base}, "main adds f.txt and edits tmpl/x.yml")
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	return r, base, pr, mainTip
+}
+
+// Issue #16, round 3: the per-path byte check runs whatever the flags say.
+// A merge over a base that changed no workflow path can still change one
+// relative to the head -- merge-ort follows renames -- so the check is not
+// gated on the recomputed carry range. The followed rename lands the base's
+// tmpl/x.yml edit in .github/workflows/x.yml, which the merged-in tip does
+// not have, so publish refuses the merge even with an approval. The run's
+// recorded flag is consistent with what publish recomputes: the merge
+// changes a workflow path relative to the head, so it is recorded as true
+// even though merge-base..onto shows no workflow path.
+func TestPublishRefusesFollowedRenameWorkflowChange(t *testing.T) {
+	r, _, pr, _ := followedRename(t)
+	origin := r.withOrigin("pr", "main")
+	baseFile, infoFile, stateFile := artifactDir(t)
+
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != mergeKindClean {
+		t.Fatalf("runMerge = %+v, %v; want a clean merge", got, err)
+	}
+	info, err := readMergeInfo(infoFile)
+	if err != nil || !info.Workflows {
+		t.Fatalf("readMergeInfo = %+v, %v; want workflows true", info, err)
+	}
+	pub := publishCheckout(t, origin, "pr")
+	// Without an approval: refused for the missing approval.
+	t.Setenv("HARNESS_APPROVED", "false")
+	if _, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r)); err == nil || !strings.Contains(err.Error(), "maintainer") {
+		t.Fatalf("publishMerge (unapproved) = %v; want an error naming the maintainer approval", err)
+	}
+	// Even with one: the merge's x.yml is not what the merged-in tip has
+	// (it has no such path at all).
+	t.Setenv("HARNESS_APPROVED", "true")
+	if _, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r)); err == nil || !strings.Contains(err.Error(), "content or mode differ") {
+		t.Fatalf("publishMerge (approved) = %v; want a refusal of the followed rename", err)
+	}
+	if head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD")); head != pr {
+		t.Fatalf("publish head = %s, want the untouched branch %s", head, pr)
+	}
+}
+
+// The same shape through the diverged fallback (no merge info): the byte
+// check runs there unconditionally too, approved or not, and the refusal
+// leaves the branch untouched.
+func TestPublishFallbackRefusesFollowedRenameWorkflowChange(t *testing.T) {
+	r, _, pr, _ := followedRename(t)
+	origin := r.withOrigin("pr", "main")
+
+	baseFile, _, stateFile := artifactDir(t)
+	if err := os.WriteFile(baseFile, []byte(pr+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	infoFile := filepath.Join(t.TempDir(), "absent.json")
+	pub := publishCheckout(t, origin, "pr")
+	for _, approved := range []string{"false", "true"} {
+		t.Setenv("HARNESS_APPROVED", approved)
+		if _, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r)); err == nil || !strings.Contains(err.Error(), "content or mode differ") {
+			t.Fatalf("publishMerge (approved=%s) = %v; want a refusal of the followed rename", approved, err)
+		}
+	}
+	if head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD")); head != pr {
+		t.Fatalf("publish head = %s, want the untouched branch %s", head, pr)
+	}
+}
+
+// Issue #16, round 3: the same change on both sides. The branch and its base
+// make the identical edit to a workflow file, so the merge changes nothing
+// relative to the head -- and needing an approval follows that, not the
+// merge-base..onto range, which does show a workflow change. The run side
+// does not merge this at all any more (the overlap rule: the file is changed
+// on both sides), so the merge info here is what an earlier run would have
+// recorded; publish recreates it with no approval, keeping the shared
+// content.
+func TestPublishSameWorkflowChangeNeedsNoApproval(t *testing.T) {
+	r := newTestRepo(t)
+	base := r.commitTree(r.indexTree(map[string]string{
+		"f.txt":                    "a\n",
+		"g.txt":                    "x\n",
+		".github/workflows/ci.yml": "a\nb\n",
+	}), nil, "base")
+	pr := r.commitTree(r.indexTree(map[string]string{
+		"f.txt":                    "a\n",
+		"g.txt":                    "x\npr\n",
+		".github/workflows/ci.yml": "A\nb\n",
+	}), []string{base}, "pr edits g.txt and ci.yml")
+	mainTip := r.commitTree(r.indexTree(map[string]string{
+		"f.txt":                    "A\n",
+		"g.txt":                    "x\n",
+		".github/workflows/ci.yml": "A\nb\n",
+	}), []string{base}, "main edits f.txt and ci.yml the same way")
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	origin := r.withOrigin("pr", "main")
+	baseFile, infoFile, stateFile := artifactDir(t)
+
+	// The run side does not merge: ci.yml is changed on both sides.
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != "none" {
+		t.Fatalf("runMerge = %+v, %v; want no merge", got, err)
+	}
+	if _, err := os.Stat(infoFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("merge info written for an overlapping branch: %v", err)
+	}
+
+	// A merge that did get recorded publishes without an approval: the merge
+	// changes no workflow path relative to the head, so nothing is carried
+	// and the per-path check has nothing to refuse.
+	tree, files, conflicted, err := mergeTree(r.dir, base, pr, mainTip)
+	if err != nil || conflicted || len(files) != 0 {
+		t.Fatalf("mergeTree = %s, %v, files %v; want a clean merge", tree, err, files)
+	}
+	commit, err := commitMerge(r.dir, tree, pr, mainTip, "Merge main into pr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(baseFile, []byte(commit+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info := mergeInfo{Kind: mergeKindClean, Commit: commit, Base: pr, Onto: mainTip, Tree: tree}
+	data, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(infoFile, append(data, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pub := publishCheckout(t, origin, "pr")
+	got, err = publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r))
+	if err != nil || got.State != mergeKindClean {
+		t.Fatalf("publishMerge = %+v, %v; want a clean merge with no approval", got, err)
+	}
+	head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD"))
+	if parents := gitTest(t, pub, "log", "--format=%P", "-1", head); strings.Fields(parents)[0] != pr || strings.Fields(parents)[1] != mainTip {
+		t.Fatalf("merge parents = %s, want [%s %s]", parents, pr, mainTip)
+	}
+	if wf := gitTest(t, pub, "cat-file", "blob", head+":.github/workflows/ci.yml"); wf != "A\nb\n" {
+		t.Fatalf("merge ci.yml = %q, want the shared edit", wf)
 	}
 }
 

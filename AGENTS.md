@@ -172,9 +172,27 @@ whether through prompt injection or a compromised model.
   trusting `merge-info.json` only as bounded, validated fields (40-hex SHAs
   and a kind of `clean` or `conflicted`): it refuses unless the tree hash
   it recomputes matches the recorded tree, and refuses the publish if any
-  previously conflicted file still contains a conflict marker. The
-  run-side merge commit is data verified by recomputation, never fetched or
-  trusted; with no `merge-info.json` present, publish falls back to merging
+  previously conflicted file still contains a conflict marker. A base merge
+  that carries the base branch's workflow changes (`workflows: true` in
+  `merge-info.json`) is published only after a maintainer approves the
+  `codeaf-harness` environment: the `run` job's `touches_harness` output
+  reads that field through the harness binary and only routes the job, so
+  `publish` still checks the approval itself, and the run brief tells the
+  agent never to merge or copy base-branch changes by hand, because publish
+  refuses an unverifiable replay. publish recomputes whether the merge
+  changes a workflow path relative to the PR head (the branch's own workflow
+  edits are kept; only paths the merge changes must equal what the merged-in
+  base commit already has, content and mode), and never trusts the
+  `workflows` field -- the field only routes the job, like `touches_harness`;
+  a run that records `workflows: false` for a merge that changes workflow
+  paths relative to the head is refused even with an approval. The check
+  runs even when the base changed no workflow path, because a merge can
+  follow a rename into `.github/workflows/`; a workflow file both the branch
+  and the base changed is not merged at all -- the run leaves the merge out,
+  the brief says a person must merge it by hand, and publish pushes the
+  patch alone. The run-side merge commit is data
+  verified by recomputation, never fetched or trusted; with no
+  `merge-info.json` present, publish falls back to merging
   the base tip first and applying the patch on top of it. It applies it with
   `git apply`, which runs nothing and refuses `.git` paths, then refuses the
   result if any staged path (rename detection off) is under `.github/` but

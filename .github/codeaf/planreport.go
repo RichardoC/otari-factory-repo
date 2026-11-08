@@ -29,6 +29,10 @@ const (
 	maxProposalField   = 3000 // runes per field
 	maxProposalsParsed = 20   // hard ceiling; the run's own cap is min(max, this)
 	maxProposalDeps    = 10   // "#N" tokens per proposal
+	// maxAreaLabelLen is GitHub's cap on a label name (50 characters, and
+	// GH treats them as bytes): an area label longer than this is never
+	// created and fails the issue-apply step (issue #40).
+	maxAreaLabelLen = 50
 )
 
 // Proposal is one proposed issue parsed from a plan run's answer (issue #61).
@@ -362,7 +366,12 @@ func ProposalLabels(p Proposal) []string {
 	case p.Area == "harness":
 		labels = append(labels, "area:harness")
 	case strings.HasPrefix(p.Area, "app/"):
-		labels = append(labels, "area:"+p.Area)
+		// The label name is capped like any other GitHub label (issue #40):
+		// truncate the app name so the full label fits, rather than dropping
+		// the label or letting an over-long one break opening the issue.
+		// The body keeps rendering the untruncated Area.
+		name := planTruncate(strings.TrimPrefix(p.Area, "app/"), maxAreaLabelLen-len("area:app/"))
+		labels = append(labels, "area:app/"+name)
 	}
 	return labels
 }

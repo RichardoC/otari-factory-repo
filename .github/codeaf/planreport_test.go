@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // planWellFormed is a well-formed answer carrying three proposals: all four
@@ -238,10 +239,13 @@ func TestParseProposalsAreaRules(t *testing.T) {
 		"### Proposal: two\n- Problem: p\n- What to do: w\n- Area: review\n\n" +
 		"### Proposal: three\n- Problem: p\n- What to do: w\n- Area: app/has space\n\n" +
 		"### Proposal: four\n- Problem: p\n- What to do: w\n- Area: app/nested/deeper\n\n" +
-		"### Proposal: five\n- Problem: p\n- What to do: w\n"
+		"### Proposal: five\n- Problem: p\n- What to do: w\n\n" +
+		"### Proposal: six\n- Problem: p\n- What to do: w\n- Area: app/" + strings.Repeat("x", 60) + "\n"
 	props := ParseProposals(answer, 10)
-	want := []string{"app/foo", "", "", "", ""}
-	if len(props) != 5 {
+	// A long app name is still an accepted shape (issue #40): the label
+	// layer bounds it, not the parser.
+	want := []string{"app/foo", "", "", "", "", "app/" + strings.Repeat("x", 60)}
+	if len(props) != 6 {
 		t.Fatalf("len(props) = %d", len(props))
 	}
 	for i, w := range want {
@@ -352,6 +356,34 @@ func TestProposalLabelsArea(t *testing.T) {
 	}
 	if got := ProposalLabels(Proposal{}); len(got) != 1 {
 		t.Errorf("no area, got %v, want only %q", got, proposedLabel)
+	}
+	// A long app name yields a label GitHub accepts: at most 50 characters
+	// (issue #40), still shaped area:app/<name>.
+	long := "app/" + strings.Repeat("x", 60)
+	got := ProposalLabels(Proposal{Area: long})
+	if len(got) != 2 || !strings.HasPrefix(got[1], "area:app/") {
+		t.Errorf("long area: got %v", got)
+	}
+	if len(got[1]) > 50 {
+		t.Errorf("long area label is %d characters, want at most 50: %q", len(got[1]), got[1])
+	}
+	// A name that fits whole is not touched.
+	if got := ProposalLabels(Proposal{Area: "app/widgets"}); got[1] != "area:app/widgets" {
+		t.Errorf("short area changed: got %v", got)
+	}
+	// A long multi-byte name: GitHub's 50 limit is bytes, so 41 runes of a
+	// 3-byte character are 123 bytes and must be cut to fit (issue #40),
+	// without splitting a character — the label stays valid UTF-8.
+	multi := "app/" + strings.Repeat("日", 60)
+	got = ProposalLabels(Proposal{Area: multi})
+	if len(got) != 2 || !strings.HasPrefix(got[1], "area:app/") {
+		t.Errorf("multi-byte area: got %v", got)
+	}
+	if len(got[1]) > 50 {
+		t.Errorf("multi-byte area label is %d bytes, want at most 50: %q", len(got[1]), got[1])
+	}
+	if !utf8.ValidString(got[1]) {
+		t.Errorf("multi-byte area label is not valid UTF-8: %q", got[1])
 	}
 }
 

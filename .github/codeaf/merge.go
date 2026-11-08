@@ -283,7 +283,7 @@ func mergeTree(dir, base, ours, theirs string) (tree string, files []string, con
 			if line == "" {
 				break // a blank line ends the conflicted paths; messages follow
 			}
-			files = append(files, line)
+			files = append(files, unquoteGitPath(line))
 		}
 	}
 	return tree, files, conflicted, nil
@@ -631,18 +631,41 @@ func runMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile string, compar
 	// the run cannot establish, that degrades to no merge: the brief names
 	// the count, and publish pushes the patch alone.
 	if conflicted && len(files) > MaxMergeConflictPaths {
-		mergeNotMade(mergeInfoFile, "the merge of %s conflicts in %d files, over the %d a merge info can name; a person must merge the branch by hand", baseRef, len(files), MaxMergeConflictPaths)
+		// The reason leads with the instruction: mergeNotMade caps it at
+		// 300 bytes, and a long base ref could cut the tail off.
+		mergeNotMade(mergeInfoFile, "a person must merge the branch by hand: the merge of %s conflicts in %d files, over the %d a merge info can name", baseRef, len(files), MaxMergeConflictPaths)
 		log.Printf("merge-default: the merge of %s conflicts in %d files, over the %d allowed; continuing without a merge (a person must merge it by hand)", baseRef, len(files), MaxMergeConflictPaths)
 		return out, nil
+	}
+	if conflicted {
+		// The reader (readMergeInfo, via sanitizeMergeFiles) refuses a
+		// conflicted path usableMergePath rejects -- one over 512 bytes,
+		// starting with "-", or the like -- and publish treats a merge
+		// info that exists but does not validate as fatal, so recording
+		// such a merge would fail every rerun the same way (issue #21,
+		// widened here to the per-path rule). Degrade to no merge instead.
+		for _, f := range files {
+			if !usableMergePath(f) {
+				mergeNotMade(mergeInfoFile, "a person must merge the branch by hand: the merge of %s conflicts in a path the merge info cannot name (%q)", baseRef, f)
+				log.Printf("merge-default: the merge of %s conflicts in a path the merge info cannot name (%q); continuing without a merge (a person must merge it by hand)", baseRef, f)
+				return out, nil
+			}
+		}
 	}
 	if conflicted {
 		// The merge info the run would record must fit what the reader
 		// accepts. The commit id is a 40-hex sha of fixed length, so a
 		// placeholder of that length sizes the record exactly; the same
-		// MarshalIndent form is what gets written below.
-		probe := mergeInfo{Kind: kind, Commit: strings.Repeat("0", 40), Base: head, Onto: onto, Tree: tree, Files: files, Workflows: carryGated}
+		// MarshalIndent form is what gets written below. The recorded
+		// Workflows value is settled only after checkMergeGated, so the
+		// probe sizes the longer one ("false" is a byte longer than
+		// "true"): a probe at exactly 64 KB must not pass and then write
+		// a byte over.
+		probe := mergeInfo{Kind: kind, Commit: strings.Repeat("0", 40), Base: head, Onto: onto, Tree: tree, Files: files, Workflows: false}
 		if data, err := json.MarshalIndent(probe, "", "  "); err == nil && len(data)+1 > 1<<16 {
-			mergeNotMade(mergeInfoFile, "the merge info for %d conflicted files would be over the 64 KB the reader accepts; a person must merge the branch by hand", len(files))
+			// The reason leads with the instruction: mergeNotMade caps it
+			// at 300 bytes, and a long base ref could cut the tail off.
+			mergeNotMade(mergeInfoFile, "a person must merge the branch by hand: the merge info for %d conflicted files would be over the 64 KB the reader accepts", len(files))
 			log.Printf("merge-default: the merge info for %s would be %d bytes, over the 64 KB allowed; continuing without a merge (a person must merge it by hand)", baseRef, len(data)+1)
 			return out, nil
 		}
@@ -710,9 +733,12 @@ func runMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile string, compar
 		return out, fmt.Errorf("wrote the merge commit but could not clear the no-merge record: %w", err)
 	}
 	if conflicted {
-		list := strings.Join(files, ", ")
+		// Unquoted paths can hold non-ASCII bytes and control characters:
+		// strip the controls (a notice line must not carry them), and cap
+		// on a rune boundary so the cut cannot split a character.
+		list := stripControl(strings.Join(files, ", "))
 		if len(list) > 400 {
-			list = list[:400] + "…"
+			list = capUTF8(list, 400) + "…"
 		}
 		fmt.Printf("::notice::merged %s (%s) into %s with conflicts; CodeAF must resolve: %s\n", baseRef, shortSHA(onto), branch, list)
 	} else {

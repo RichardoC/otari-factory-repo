@@ -482,6 +482,101 @@ func TestRunMergeDegradesWideConflictToNoMerge(t *testing.T) {
 	}
 }
 
+// Issue #33: git C-quotes a non-ASCII conflicted path in --name-only output
+// (on git 2.43, a conflict in é.txt comes back as "\303\251.txt"), so the
+// recorded merge-info path, the marker check and the brief would all name a
+// file that does not exist. mergeTree unquotes, and this walks the whole
+// chain a conflict in é.txt takes: the merge info, verifyMerge (which reads
+// the path from disk), and the brief section.
+func TestRunMergeRecordsNonASCIIConflictPathsUnquoted(t *testing.T) {
+	r := newTestRepo(t)
+	base := r.commit("base", map[string]string{"é.txt": "a\nb\nc\n"})
+	pr := r.commit("pr change", map[string]string{"é.txt": "a\npr\nc\n"}, base)
+	mainTip := r.commit("main change", map[string]string{"é.txt": "a\nbase\nc\n"}, base)
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	r.withOrigin("pr", "main")
+	baseFile, infoFile, stateFile := artifactDir(t)
+
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != mergeKindConflicted {
+		t.Fatalf("runMerge: state=%q err=%v; want conflicted", got.State, err)
+	}
+	info, err := readMergeInfo(infoFile)
+	if err != nil {
+		t.Fatalf("merge info: %v", err)
+	}
+	if !reflect.DeepEqual(info.Files, []string{"é.txt"}) {
+		t.Fatalf("merge info files = %q, want [é.txt]", info.Files)
+	}
+	if raw, err := os.ReadFile(infoFile); err != nil || strings.Contains(string(raw), `\303`) {
+		t.Fatalf("merge info records the C-quoted path: %q (%v)", raw, err)
+	}
+
+	// The marker check reads each recorded path from the working tree, which
+	// still carries the unresolved markers: it must find them in é.txt, not
+	// fail to open a quoted name that does not exist.
+	if err := writeMergeState(stateFile, got); err != nil {
+		t.Fatal(err)
+	}
+	err = verifyMerge(r.dir, stateFile)
+	// For a single file the path is named on a ::error:: line, not in the
+	// returned error; "could not read" would mean the check tried the
+	// C-quoted name, which does not exist on disk.
+	if err == nil || !strings.Contains(err.Error(), "conflict marker") || strings.Contains(err.Error(), "could not read") {
+		t.Fatalf("verifyMerge err = %v; want a marker refusal for é.txt (the file it must read)", err)
+	}
+	if marked, err := os.ReadFile(filepath.Join(r.dir, "é.txt")); err != nil || !strings.Contains(string(marked), "<<<<<<<") {
+		t.Fatalf("é.txt in the checkout carries no markers: %q (%v)", marked, err)
+	}
+
+	// The brief names the file the agent must resolve.
+	section, err := mergeBriefSection(infoFile)
+	if err != nil {
+		t.Fatalf("mergeBriefSection: %v", err)
+	}
+	if !strings.Contains(section, "é.txt") {
+		t.Fatalf("brief section lacks é.txt:\n%s", section)
+	}
+}
+
+// Issue #33: the writer must check conflicted paths the way the reader does.
+// A conflicted path usableMergePath rejects -- here one starting with "-",
+// which a later command line could take for a flag -- would be recorded into
+// a merge-info.json the reader refuses, and publish treats a merge info that
+// exists but does not validate as fatal, so every rerun would fail the same
+// way. runMerge degrades to no merge instead, with a recorded reason.
+func TestRunMergeDegradesUnusableConflictPathToNoMerge(t *testing.T) {
+	r := newTestRepo(t)
+	base := r.commit("base", map[string]string{"-flag.txt": "a\nb\nc\n"})
+	pr := r.commit("pr change", map[string]string{"-flag.txt": "a\npr\nc\n"}, base)
+	mainTip := r.commit("main change", map[string]string{"-flag.txt": "a\nbase\nc\n"}, base)
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	r.withOrigin("pr", "main")
+	baseFile, infoFile, _ := artifactDir(t)
+
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != "none" {
+		t.Fatalf("runMerge: state=%q err=%v; want none", got.State, err)
+	}
+	if r.head() != pr {
+		t.Fatal("the branch moved without a merge")
+	}
+	if _, err := os.Stat(infoFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("merge info written for a merge that was not made: %v", err)
+	}
+	runState, err := os.ReadFile(runStateFile(infoFile))
+	if err != nil {
+		t.Fatalf("no no-merge record: %v", err)
+	}
+	if !strings.Contains(string(runState), "state=none") || !strings.Contains(string(runState), "cannot name") {
+		t.Fatalf("no-merge reason = %q; want the unusable-path refusal", runState)
+	}
+}
+
 // ---------------------------------------------------------------- the brief
 
 func TestMergeBriefSectionNamesConflictedFiles(t *testing.T) {

@@ -453,31 +453,35 @@ maintainer must approve. With approval, `publish` recreates the merge (still
 from the same two parents, still verified by tree hash) and pushes it with
 the GitHub App token, which can carry workflow changes where `GITHUB_TOKEN`
 cannot; it refuses unless every workflow path the merge changes relative to
-the PR head equals the recorded base tip's content byte-for-byte -- additions,
-edits and deletions alike -- so the merge brings in only what the base
-already has. Without approval, `publish` refuses with an error naming the
+the PR head equals the recorded base tip's content and file mode --
+additions, edits and deletions alike -- so the merge brings in only what the
+base already has. Without approval, `publish` refuses with an error naming the
 maintainer approval rather than silently pushing the patch alone. When there
 is no `merge-info.json` (the behind and diverged fallbacks), the patch is
 still pushed alone without approval, and the base is merged in as above once
 approved.
 
 The `workflows` field is untrusted input from the `run` job, so `publish`
-never trusts it: it recomputes whether the recreated merge carries workflow
-changes itself, requires the approval whenever the recomputed list is
-non-empty or the field is set, and refuses -- even with an approval -- a run
-that recorded `workflows: false` for a merge that does carry them. The field,
-like `touches_harness`, only routes the job. The byte check compares the
-merge with the base tip the run actually merged in, not the base branch's
-current tip.
+never trusts it: it recomputes whether the recreated merge changes a workflow
+path relative to the PR head, requires the approval whenever that
+recomputation says so -- an error counting as changed -- or the field is set,
+and refuses, even with an approval, a run that recorded `workflows: false`
+for a merge that changes workflow paths relative to the head. The field,
+like `touches_harness`, only routes the job. The byte check runs whatever the
+flags say, and it compares the merge with the base tip the run actually
+merged in, not the base branch's current tip.
 
 "Carries" is measured relative to the PR head: the branch's own workflow
-edits are kept, because a merge that leaves a workflow path as the head has
-it publishes nothing new, so that path is neither checked nor gated on the
+edits are kept, because a merge that leaves a workflow path as it is on the
+head publishes nothing new, so that path is neither checked nor gated on the
 approval. Only workflow paths the merge actually changes must equal the
-base's content, and bringing those in needs the approval. A PR that edits
-the same workflow file its base changed may still conflict, or merge that
-file into content the base does not have; `publish` refuses such a merge,
-and the PR needs a person to sort it out.
+merged-in base tip's content and mode, and bringing those in needs the
+approval. The check is not fooled by renames either: it runs even when the
+base changed no workflow path, because a merge can follow a rename into
+`.github/workflows/`. A workflow file that the branch and its base both
+changed is not merged at all -- the merged content would equal neither
+side's, so the run skips the merge and the brief says a person must merge
+the branch by hand, and `publish` pushes the patch alone.
 
 ### Keeping CodeAF current (issue #35)
 

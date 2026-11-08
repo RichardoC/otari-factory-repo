@@ -35,8 +35,13 @@
 // "workflows": true), the workflow reads that field through "harness
 // merge-default workflows" and routes publish into the approval-gated
 // codeaf-harness environment, and publish recreates it only once a
-// maintainer approved, verifying that its workflow files equal the base
-// branch's byte-for-byte.
+// maintainer approved. "Carries" is measured relative to the PR head: the
+// workflow paths the merge commit changes against the head it started from,
+// each of which must equal the merged-in base tip's content and mode. The
+// head's own workflow edits are kept; a workflow file both the branch and
+// the base changed is not merged at all -- the merged content would equal
+// neither side's, so publish would refuse it even approved -- and the patch
+// is pushed alone instead.
 //
 // The invariants hold: `git apply` is still the only thing applied from run;
 // the .github/ approval check still reads the staged patch diff; and every
@@ -79,12 +84,14 @@ type mergeInfo struct {
 	Onto   string   `json:"onto"`   // the base branch tip merged in
 	Tree   string   `json:"tree"`   // the merged tree (carrying markers when conflicted)
 	Files  []string `json:"files"`  // the paths the merge conflicted in
-	// Workflows records that the base branch changed .github/workflows/
-	// between the branch point and the tip the run merged in (issue #16).
-	// Such a merge can only be pushed with the GitHub App token, so the
-	// workflow reads this field (through "harness merge-default workflows",
-	// never parsed in shell) to route publish into the codeaf-harness
-	// environment, and recreateMerge still checks the approval itself.
+	// Workflows records that the merge changes a workflow path relative to
+	// the PR head (issue #16) -- the base branch's workflow changes since
+	// the branch point, plus any path a rename the merge follows lands in
+	// .github/workflows/. Such a merge can only be pushed with the GitHub
+	// App token, so the workflow reads this field (through "harness
+	// merge-default workflows", never parsed in shell) to route publish
+	// into the codeaf-harness environment; recreateMerge still checks the
+	// approval itself, against its own recomputation, never this field.
 	Workflows bool `json:"workflows"`
 }
 
@@ -518,6 +525,20 @@ func runMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile string, compar
 		log.Printf("merge-default: could not fetch the merge base %s (%v); continuing without a merge", shortSHA(base), err)
 		return out, nil
 	}
+	// Issue #16: a workflow file the base changed and this branch also
+	// edits is not merged. The merged content would equal neither the
+	// head's nor the base tip's, so publish would refuse the merge even
+	// with a maintainer's approval, and every later run on this PR would
+	// lose its work. The run proceeds on the bare head instead, the brief
+	// names the files, and publish pushes the patch alone until a person
+	// merges the branch by hand.
+	if overlap, err := overlappingWorkflows(dir, base, onto, head); err != nil {
+		log.Printf("merge-default: could not tell whether the branch and %s edited the same workflow files (%v); the overlap check is skipped", baseRef, err)
+	} else if len(overlap) > 0 {
+		mergeNotMade(mergeInfoFile, "the base branch changed workflow file(s) %s that this branch also edits; the merged content would equal neither side's, so a person must merge it by hand", strings.Join(overlap, ", "))
+		log.Printf("merge-default: %s changed workflow file(s) %s that %s also edits; continuing without a merge (a person must merge it by hand)", baseRef, strings.Join(overlap, ", "), branch)
+		return out, nil
+	}
 	// Issue #16: the base having changed .github/workflows/ no longer skips
 	// the merge. Such a merge can only be pushed with the GitHub App token,
 	// so it is recorded as merge-info.json "workflows": true and the
@@ -554,6 +575,18 @@ func runMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile string, compar
 		mergeNotMade(mergeInfoFile, "the merge commit could not be committed: %v", err)
 		log.Printf("merge-default: could not commit the merge (%v); continuing without one", err)
 		return out, nil
+	}
+	// The recorded flag matches what publish checks: whether the merge
+	// commit changes a workflow path relative to the head it started from.
+	// merge-ort follows renames, so this can differ from merge-base..onto:
+	// a branch that moved a file into .github/workflows/ while the base
+	// edited it at the old path carries a workflow change the range above
+	// does not see. An error counts as carrying, as above.
+	if relWf, err := workflowChanges(dir, head, commit); err != nil {
+		log.Printf("merge-default: could not tell which workflow paths the merge changes relative to the head (%v); recording that it may carry workflow changes", err)
+		carryWorkflows = true
+	} else if len(relWf) > 0 {
+		carryWorkflows = true
 	}
 	if err := gitRun(dir, "reset", "--hard", commit); err != nil {
 		mergeNotMade(mergeInfoFile, "the merge commit could not be checked out: %v", err)
@@ -668,6 +701,16 @@ func publishMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile, stateFile
 		if err := refuseReplayedBaseMerge(dir, patchPath, head, onto); err != nil {
 			return out, err
 		}
+		// Issue #16: the same overlap rule as the run side -- though the
+		// merge base here is the head itself, so the branch made no
+		// workflow change since the branch point and the overlap is always
+		// empty -- kept so what may be merged has one definition.
+		if overlap, err := overlappingWorkflows(dir, head, onto, head); err != nil {
+			log.Printf("merge-default: could not tell whether the branch edited the workflow files %s changed (%v); the overlap check is skipped", baseRef, err)
+		} else if len(overlap) > 0 {
+			log.Printf("merge-default: %s changed workflow file(s) %s that the branch also edits; pushing the patch without the merge", baseRef, strings.Join(overlap, ", "))
+			return out, nil
+		}
 		// Issue #16: with a maintainer's approval the merge goes through --
 		// the push step then uses the GitHub App token, which can carry the
 		// workflow changes. Without one the patch is pushed alone, as before.
@@ -725,6 +768,17 @@ func publishMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile, stateFile
 	if err := refuseReplayedBaseMerge(dir, patchPath, base, onto); err != nil {
 		return out, err
 	}
+	// Issue #16: a workflow file the base changed and the branch also edits
+	// is not merged here either: the merged content would equal neither the
+	// head's nor the base tip's, and publish would refuse it even with a
+	// maintainer's approval. The patch goes alone, whatever the approval
+	// said, and a person merges the branch by hand.
+	if overlap, err := overlappingWorkflows(dir, base, onto, head); err != nil {
+		log.Printf("merge-default: could not tell whether the branch and %s edited the same workflow files (%v); the overlap check is skipped", baseRef, err)
+	} else if len(overlap) > 0 {
+		log.Printf("merge-default: %s changed workflow file(s) %s that the branch also edits; pushing the patch without the merge (a person must merge it by hand)", baseRef, strings.Join(overlap, ", "))
+		return out, nil
+	}
 	// Issue #16: with a maintainer's approval the merge goes through -- the
 	// push step then uses the GitHub App token, which can carry the workflow
 	// changes. Without one the patch is pushed alone, as before.
@@ -779,17 +833,39 @@ func mergeWorkflowsRouting(path string) (bool, error) {
 	return info.Workflows, nil
 }
 
-// recomputeWorkflowsCarried reports whether a merge between from and to
-// carries changes under .github/workflows/: the differing-file list is
-// non-empty, or an error left the question open (counted as carrying, as the
-// run side counts it). Publish recomputes this itself because the run's
-// "workflows" field in merge-info.json is untrusted input.
-func recomputeWorkflowsCarried(dir, from, to string) (bool, error) {
-	wf, err := workflowChanges(dir, from, to)
-	if err != nil {
-		return true, err
+// intersectPaths returns the paths that appear in both lists, sorted.
+func intersectPaths(a, b []string) []string {
+	inB := make(map[string]bool, len(b))
+	for _, p := range b {
+		inB[p] = true
 	}
-	return len(wf) > 0, nil
+	var both []string
+	for _, p := range a {
+		if inB[p] {
+			both = append(both, p)
+		}
+	}
+	sort.Strings(both)
+	return both
+}
+
+// overlappingWorkflows returns the workflow paths that both the base branch
+// and the PR branch changed since the branch point: paths a merge would set
+// to content that is neither the head's nor the base tip's, which publish
+// refuses even with a maintainer's approval (issue #16), so such a merge is
+// not made at all and the patch is pushed alone. An error means the question
+// could not be answered; callers skip the overlap check then, and the
+// approval gate and the byte check decide instead.
+func overlappingWorkflows(dir, base, onto, head string) ([]string, error) {
+	baseWf, err := workflowChanges(dir, base, onto)
+	if err != nil {
+		return nil, err
+	}
+	headWf, err := workflowChanges(dir, base, head)
+	if err != nil {
+		return nil, err
+	}
+	return intersectPaths(baseWf, headWf), nil
 }
 
 // checkFallbackWorkflows verifies, for a merge publish landed itself (the
@@ -807,37 +883,40 @@ func checkFallbackWorkflows(dir, head, commit, onto string) error {
 
 // checkMergeWorkflows is the workflow byte check shared by recreateMerge and
 // the fallbacks: for each path under .github/workflows/ that the merge
-// commit changes relative to the PR head, the merge's content must equal the
-// commit merged in's (onto) -- additions, edits and deletions alike -- so a
-// merge brings in only what the base already has, never workflow content of
-// its own. Paths the merge leaves as they are on head are the branch's own
-// edits, already on the branch, so they are not checked.
+// commit changes relative to the PR head, the merge's content and file mode
+// must equal the commit merged in's (onto) -- additions, edits and deletions
+// alike -- so a merge brings in only what the base already has, never
+// workflow content of its own. Paths the merge leaves as they are on head
+// are the branch's own edits, already on the branch, so they are not
+// checked.
 func checkMergeWorkflows(dir, head, commit, onto string) error {
 	changed, err := workflowChanges(dir, head, commit)
 	if err != nil {
 		return fmt.Errorf("could not list the workflow paths the merge changes relative to the PR head: %w", err)
 	}
 	for _, path := range changed {
-		inMerge, err := blobHash(dir, commit, path)
+		inMerge, err := blobEntry(dir, commit, path)
 		if err != nil {
 			return fmt.Errorf("could not read %s in the merge commit %s: %w", path, shortSHA(commit), err)
 		}
-		inOnto, err := blobHash(dir, onto, path)
+		inOnto, err := blobEntry(dir, onto, path)
 		if err != nil {
 			return fmt.Errorf("could not read %s in the commit merged in (%s): %w", path, shortSHA(onto), err)
 		}
 		if inMerge != inOnto {
-			return fmt.Errorf("the merge changes the workflow file %s, but its content differs from the commit it merged in (%s); a base merge brings in only what the base branch already has, so refusing the merge", path, shortSHA(onto))
+			return fmt.Errorf("the merge changes the workflow file %s, but it is not what the commit it merged in (%s) already has (content or mode differ); a base merge brings in only what the base branch already has, so refusing the merge", path, shortSHA(onto))
 		}
 	}
 	return nil
 }
 
-// blobHash returns the hash of the blob git stores for path in rev, or the
-// empty string when the path does not exist there (a deletion), so a
-// workflow file the merge deletes compares equal only to one the merged-in
-// commit lacks too. Reading hashes keeps the comparison off the work tree.
-func blobHash(dir, rev, path string) (string, error) {
+// blobEntry returns git's ls-tree entry for path in rev -- its mode and
+// blob hash, so the per-path check compares the file mode as well as the
+// content -- or the empty string when the path does not exist there (a
+// deletion), so a workflow file the merge deletes compares equal only to one
+// the merged-in commit lacks too. Reading entries keeps the comparison off
+// the work tree.
+func blobEntry(dir, rev, path string) (string, error) {
 	out, err := gitOutput(dir, "ls-tree", rev, "--", path)
 	if err != nil {
 		return "", err
@@ -856,7 +935,7 @@ func blobHash(dir, rev, path string) (string, error) {
 	if len(fields) != 3 {
 		return "", fmt.Errorf("could not parse git ls-tree output for %s in %s", path, shortSHA(rev))
 	}
-	return fields[2], nil
+	return fields[0] + " " + fields[2], nil
 }
 
 // mergeApproved reports whether the publish job recorded a maintainer's
@@ -874,13 +953,16 @@ func mergeApproved() bool {
 // the base tip it merged is a commit the base branch contains (anything else
 // could smuggle content into the merge under the cover of "bringing the base
 // in"), and the tree of the merge publish computes itself matches the
-// recorded tree. A merge the run recorded as carrying the base branch's
-// workflow changes (issue #16) is recreated only when a maintainer approved
-// this run: the push then uses the GitHub App token, which GitHub lets carry
-// workflow files, and the recreated merge's .github/workflows/ must equal the
-// base branch's byte-for-byte -- the merge brings in only what main already
-// has, never a workflow edit of the branch's own (that travels in the patch,
-// where the approval check and the workflow policy see it).
+// recorded tree. A merge carrying workflow changes relative to the PR head
+// (issue #16) is recreated only when a maintainer approved this run: the
+// push then uses the GitHub App token, which GitHub lets carry workflow
+// files. Publish recomputes "carries" itself, relative to the head -- the
+// workflow paths the merge commit changes against the head it started from,
+// never the run's "workflows" field -- and every path it changes must equal
+// the recorded base tip's content and mode: the merge brings in only what
+// the base already has, never a workflow edit of the branch's own (that
+// travels in the patch, where the approval check and the workflow policy
+// see it).
 func recreateMerge(dir, branch, baseRef string, info *mergeInfo, baseCommit, head string, compare compareFunc) (mergeOutcome, error) {
 	out := mergeOutcome{State: "none"}
 	if info.Workflows && !mergeApproved() {
@@ -941,26 +1023,6 @@ func recreateMerge(dir, branch, baseRef string, info *mergeInfo, baseCommit, hea
 	if err := fetchCommit(dir, base); err != nil {
 		return out, fmt.Errorf("could not fetch the merge base %s: %w", shortSHA(base), err)
 	}
-	// The run's workflows flag is untrusted: merge-info.json comes from the
-	// run job, so publish recomputes whether the merge carries the base's
-	// workflow changes itself, over the same range the run used -- the merge
-	// base computed above and the recorded base tip, not the PR head
-	// (info.Base): the head's own workflow edits are already on the branch
-	// and publish nothing new, so counting them would refuse every branch
-	// that edits a workflow file of its own. An error telling the cases
-	// apart counts as carrying, as on the run side. A run that recorded
-	// "workflows": false for a merge that does carry them lied about its
-	// merge: refused even if a maintainer approved, because nothing else it
-	// recorded about the merge can be trusted either.
-	carries, wfErr := recomputeWorkflowsCarried(dir, base, info.Onto)
-	if wfErr == nil && carries && !info.Workflows {
-		return out, fmt.Errorf("the run recorded that its merge carries no workflow changes, but %s and %s differ under .github/workflows/; the run lied about its merge, so refusing it even if a maintainer approved", shortSHA(base), shortSHA(info.Onto))
-	}
-	// Carrying workflow changes (recomputed or recorded) needs the
-	// maintainer's approval, whatever the run recorded.
-	if (carries || info.Workflows) && !mergeApproved() {
-		return out, errors.New("the merge carries the base branch's workflow changes, and publishing one needs a maintainer's approval of the codeaf-harness environment (HARNESS_APPROVED, checked through the API); no maintainer approved this run, so refusing the merge")
-	}
 	tree, files, conflicted, err := mergeTree(dir, base, head, info.Onto)
 	if err != nil {
 		return out, fmt.Errorf("could not recompute the recorded merge: %w", err)
@@ -979,20 +1041,50 @@ func recreateMerge(dir, branch, baseRef string, info *mergeInfo, baseCommit, hea
 	if err != nil {
 		return out, err
 	}
-	// Issue #16: every workflow path the merge changes relative to the PR
-	// head must be byte-for-byte what the commit it merged in already has --
-	// the recorded base tip (info.Onto), not the base branch's current tip,
-	// which may have moved on since the run. The tree hash above proves the
-	// merge is the one the run recorded; this proves that what it records is
-	// only the base's workflows. The head's own workflow edits are kept:
-	// paths the merge leaves as they are on head are not checked, and a
-	// merge that changes a workflow path into anything but the base tip's
-	// content is refused, whatever the approval said. Checked before the
-	// reset, so a refusal leaves the branch untouched.
-	if carries || info.Workflows {
-		if err := checkMergeWorkflows(dir, head, commit, info.Onto); err != nil {
-			return out, err
-		}
+	// Issue #16: "carries" is measured relative to the PR head -- the
+	// workflow paths the merge commit changes against the head it started
+	// from. The head's own workflow edits are already on the branch and
+	// publish nothing new, and merge-ort follows renames, so this can
+	// differ from what merge-base..onto changes: a merge over a base that
+	// changed no workflow path can still land one in .github/workflows/
+	// when the branch moved a file there and the base edited it at the old
+	// path. An error counts as carrying, as on the run side. Everything
+	// below is checked before the reset, so a refusal leaves the branch
+	// untouched.
+	headCarries := false
+	if changed, err := workflowChanges(dir, head, commit); err != nil {
+		log.Printf("merge-default: could not tell which workflow paths the merge changes relative to the head (%v); treating it as carrying workflow changes", err)
+		headCarries = true
+	} else {
+		headCarries = len(changed) > 0
+	}
+	// The run's flag is checked against the recomputed value, never
+	// trusted: merge-info.json comes from the run job. A run that recorded
+	// "workflows": false for a merge that changes workflow paths relative
+	// to the head lied about its merge -- refused even if a maintainer
+	// approved, because nothing else it recorded about the merge can be
+	// trusted either.
+	if headCarries && !info.Workflows {
+		return out, errors.New("the run recorded that its merge carries no workflow changes, but the merge changes workflow paths under .github/workflows/ relative to the branch head; the run lied about its merge, so refusing it even if a maintainer approved")
+	}
+	// Carrying workflow changes relative to the head (recomputed or
+	// recorded) needs the maintainer's approval, whatever the run recorded:
+	// the push then uses the GitHub App token, which GitHub lets carry
+	// workflow files.
+	if (headCarries || info.Workflows) && !mergeApproved() {
+		return out, errors.New("the merge carries workflow changes relative to the branch head, and publishing one needs a maintainer's approval of the codeaf-harness environment (HARNESS_APPROVED, checked through the API); no maintainer approved this run, so refusing the merge")
+	}
+	// The per-path byte check runs whatever the flags say: for each workflow
+	// path the merge changes relative to the PR head, its content and mode
+	// must be what the recorded base tip (info.Onto) already has -- not the
+	// base branch's current tip, which may have moved on since the run. The
+	// tree hash above proves the merge is the one the run recorded; this
+	// proves that what it records brings in only the base's workflows. The
+	// head's own workflow edits are kept: paths the merge leaves as they are
+	// on head are not checked, and a merge that carries nothing changes no
+	// workflow path relative to the head, so the check costs nothing there.
+	if err := checkMergeWorkflows(dir, head, commit, info.Onto); err != nil {
+		return out, err
 	}
 	if err := gitRun(dir, "reset", "--hard", commit); err != nil {
 		return out, err

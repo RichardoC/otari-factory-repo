@@ -1019,11 +1019,13 @@ func TestMergeBriefSectionEscapesBacktickInName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mergeBriefSection: %v", err)
 	}
-	if !strings.Contains(section, "- a\\`b.txt\n") {
-		t.Fatalf("the backtick name is not listed escaped:\n%s", section)
+	// Issue #35: the name renders inside a double-backtick code span, not as
+	// plain markdown with escaped backticks.
+	if !strings.Contains(section, "- ``a`b.txt``\n") {
+		t.Fatalf("the backtick name is not listed in a double-backtick span:\n%s", section)
 	}
-	if strings.Contains(section, "`a`b") {
-		t.Fatalf("the backtick name breaks out of a code span:\n%s", section)
+	if strings.Contains(section, "- a\\`b.txt") {
+		t.Fatalf("the backtick name is still listed as plain markdown:\n%s", section)
 	}
 }
 
@@ -3095,4 +3097,191 @@ func TestRegressionSquashFromRun39094290325(t *testing.T) {
 			t.Fatal("the replay patch applied on the merged tree; the squash is still reachable")
 		}
 	})
+}
+
+// Issue #35: publish sanitised the conflict names the run recorded, but
+// wrote the names it recomputed itself from mergeTree straight into
+// <state>.files. An agent rewriting merge-info.json after the run could
+// record the true tree of a merge conflicting in a file named "a\nb" with a
+// Files list that passes sanitising: the raw name split at the newline into
+// "a" and "b", neither file exists, and verifyMerge read the conflict as
+// resolved by deleting them -- the markers in "a\nb" were published. The
+// recomputed list is now sanitised like the recorded one, and a merge whose
+// Files do not name its own tree's conflicts is refused, approved or not.
+func TestPublishRefusesRecomputedConflictNameOutsideMergeInfo(t *testing.T) {
+	r := newTestRepo(t)
+	base := r.commitTree(r.indexTree(map[string]string{"a\nb": "x\n"}), nil, "base")
+	pr := r.commitTree(r.indexTree(map[string]string{"a\nb": "pr side\n"}), []string{base}, "pr change")
+	mainTip := r.commitTree(r.indexTree(map[string]string{"a\nb": "main side\n", "h.txt": "new\n"}), []string{base}, "main change")
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	tree, files, conflicted, err := mergeTree(r.dir, base, pr, mainTip)
+	if err != nil || !conflicted {
+		t.Fatalf("mergeTree = %s, conflicted %t, %v; want a conflict", tree, conflicted, err)
+	}
+	// The attack shape: the recorded tree and kind are the true ones, but
+	// Files names only a path sanitising accepts -- the real conflicted
+	// name, which holds a raw newline, is left out of the list the reader
+	// validates.
+	commit := r.commitTree(tree, []string{pr, mainTip}, "Merge main into pr")
+	if !reflect.DeepEqual(files, []string{"a\nb"}) {
+		t.Fatalf("mergeTree files = %q; want [a\\nb]", files)
+	}
+	origin := r.withOrigin("pr", "main")
+	baseFile, infoFile, stateFile := artifactDir(t)
+	if err := os.WriteFile(baseFile, []byte(commit+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info := mergeInfo{Kind: mergeKindConflicted, Commit: commit, Base: pr, Onto: mainTip, Tree: tree, Files: []string{"f.txt"}}
+	data, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(infoFile, append(data, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, approved := range []string{"false", "true"} {
+		t.Setenv("HARNESS_APPROVED", approved)
+		pub := publishCheckout(t, origin, "pr")
+		_, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r))
+		if err == nil {
+			t.Fatalf("publishMerge (approved=%s) accepted a merge info whose Files do not name the conflicts of its own tree", approved)
+		}
+		if strings.ContainsAny(err.Error(), "\r\n\x00") {
+			t.Fatalf("the refusal carries a raw control character: %q", err)
+		}
+		if !strings.Contains(err.Error(), `a\nb`) {
+			t.Fatalf("the refusal does not name the unusable path with the newline escaped: %q", err)
+		}
+		if head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD")); head != pr {
+			t.Fatalf("publish head = %s, want the untouched branch %s", head, pr)
+		}
+		if _, ferr := os.Stat(stateFile + ".files"); ferr == nil {
+			t.Fatalf("publishMerge (approved=%s) wrote a conflicted file list for a refused merge", approved)
+		}
+	}
+}
+
+// Issue #35: checkMergeGated names the gated path in its error, which
+// log.Fatal prints. A path unquoted out of git's C-quoting can carry a raw
+// CR, which would end the line and forge a workflow command; the errors now
+// print the path with %q.
+func TestCheckMergeGatedErrorQuotesRawCR(t *testing.T) {
+	r := newTestRepo(t)
+	head := r.commit("head", map[string]string{"f.txt": "x\n"})
+	onto := r.commit("onto", map[string]string{".github/workflows/w\r.yml": "base\n"})
+	commit := r.commit("merge", map[string]string{"f.txt": "x\n", ".github/workflows/w\r.yml": "merge\n"}, head, onto)
+	err := checkMergeGated(r.dir, head, commit, onto)
+	if err == nil {
+		t.Fatal("checkMergeGated accepted a merge changing a gated file to content the merged-in commit does not have")
+	}
+	if strings.ContainsAny(err.Error(), "\r\x00") || strings.Count(err.Error(), "\n") > 0 {
+		t.Fatalf("the error carries a raw control character or more than one line: %q", err)
+	}
+	if !strings.Contains(err.Error(), `w\r.yml`) {
+		t.Fatalf("the error does not quote the path with the CR escaped: %q", err)
+	}
+}
+
+// Issue #35: the run job's overlap log line joined the raw git-derived
+// paths. A gated name carrying a raw CR split the line and could forge a
+// workflow command; the list is now printed with %q per path.
+func TestRunMergeOverlapLogQuotesRawCR(t *testing.T) {
+	r := newTestRepo(t)
+	base := r.commitTree(r.indexTree(map[string]string{
+		"g.txt":                     "x\n",
+		".github/workflows/w\r.yml": "a\n",
+	}), nil, "base")
+	pr := r.commitTree(r.indexTree(map[string]string{
+		"g.txt":                     "x\npr\n",
+		".github/workflows/w\r.yml": "A\n",
+	}), []string{base}, "pr edits g.txt and the top of the gated file")
+	mainTip := r.commitTree(r.indexTree(map[string]string{
+		"f.txt":                     "main\n",
+		"g.txt":                     "x\n",
+		".github/workflows/w\r.yml": "b\n",
+	}), []string{base}, "main adds f.txt and edits the gated file")
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	_ = r.withOrigin("pr", "main")
+	baseFile, infoFile, stateFile := artifactDir(t)
+	logged := captureLogs(t)
+
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != "none" {
+		t.Fatalf("runMerge = %+v, %v; want no merge", got, err)
+	}
+	out := logged.String()
+	if strings.ContainsAny(out, "\r\x00") {
+		t.Fatalf("the run log carries a raw control character: %q", out)
+	}
+	if !strings.Contains(out, `w\r.yml`) {
+		t.Fatalf("the overlap log line does not quote the path with the CR escaped: %q", out)
+	}
+	_ = stateFile
+}
+
+// Issue #35: the ::error:: backstop print is a helper, tested directly --
+// usableMergePath refuses a control-bearing path before verifyMerge ever
+// reaches the print, so the whole-path test cannot cover it.
+func TestPrintConflictMarkerErrorStripsControlCharacters(t *testing.T) {
+	old := os.Stdout
+	rd, wr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = wr
+	printConflictMarkerError("x\r::warning::x")
+	wr.Close()
+	os.Stdout = old
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, rd); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if out != "::error::conflict marker left in x::warning::x\n" {
+		t.Fatalf("the ::error:: print is not one stripped line: %q", out)
+	}
+}
+
+// Issue #35: a name holding a backtick renders inside one code span fenced
+// with more backticks than the name's longest run, no longer as plain
+// markdown with escaped backticks.
+func TestMergeBriefSectionBacktickNameStaysInCodeSpan(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "merge-info.json")
+	write := func(files []string) {
+		t.Helper()
+		info := mergeInfo{
+			Kind: mergeKindConflicted, Commit: strings.Repeat("a", 40), Base: strings.Repeat("b", 40),
+			Onto: strings.Repeat("c", 40), Tree: strings.Repeat("d", 40), Files: files,
+		}
+		data, err := json.Marshal(info)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, c := range []struct {
+		name string
+		want string
+	}{
+		{"a`b.txt", "- ``a`b.txt``\n"},
+		{"a``b`c", "- ```a``b`c```\n"},
+		{"`lead.txt", "- `` `lead.txt ``\n"},
+		{"plain.txt", "- `plain.txt`\n"},
+	} {
+		write([]string{c.name})
+		section, err := mergeBriefSection(path)
+		if err != nil {
+			t.Fatalf("mergeBriefSection for %q: %v", c.name, err)
+		}
+		if !strings.Contains(section, c.want) {
+			t.Fatalf("the name %q is not rendered as %q:\n%s", c.name, c.want, section)
+		}
+	}
 }

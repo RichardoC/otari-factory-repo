@@ -486,6 +486,7 @@ The SQLite cache stores:
 
 - Snyk DAST-side normalized hashes keyed by fingerprint
 - Linear-side normalized hashes keyed by fingerprint
+- the UTC time the snapshot was saved, reported as `saved_at` in cache logs
 - a schema signature for the managed issue format
 
 The cache is used only as an optimization. It should never be the only source

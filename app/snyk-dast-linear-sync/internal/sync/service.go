@@ -156,6 +156,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		if err != nil {
 			return RunResult{}, err
 		}
+		s.logger.Info("loaded sync cache", slog.Time("saved_at", loaded.SavedAt))
 		if loaded.SchemaSignature != "" && loaded.SchemaSignature != cacheSignature {
 			cacheEnabled = false
 			s.logger.Info("ignoring sync cache because managed schema changed",
@@ -536,6 +537,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			}
 		}
 		nextSnapshot := cache.Snapshot{
+			SavedAt:         time.Now().UTC(),
 			SchemaSignature: cacheSignature,
 			SnykDASTHashes:  snykdastHashes,
 			LinearHashes:    cacheLinearHashes,
@@ -544,6 +546,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			return result, err
 		}
 		s.logger.Info("refreshed sync cache",
+			slog.Time("saved_at", nextSnapshot.SavedAt),
 			slog.Int("snyk_dast_rows", len(nextSnapshot.SnykDASTHashes)),
 			slog.Int("linear_rows", len(nextSnapshot.LinearHashes)),
 			slog.Int("uncached_failed", uncachedFailedCount),

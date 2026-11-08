@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestSaveAndLoadRoundTripsHashes(t *testing.T) {
@@ -32,6 +33,9 @@ func TestSaveAndLoadRoundTripsHashes(t *testing.T) {
 	loaded, err := store.Load(ctx)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
+	}
+	if loaded.SavedAt.IsZero() {
+		t.Fatal("SavedAt is zero, want Save to record a timestamp")
 	}
 	if loaded.SchemaSignature != "test-sig-v1" {
 		t.Fatalf("SchemaSignature = %q, want %q", loaded.SchemaSignature, "test-sig-v1")
@@ -90,5 +94,25 @@ func TestSaveReplacesPreviousSnapshot(t *testing.T) {
 	}
 	if _, exists := loaded.LinearHashes["snyk-dast:target-a:finding-1"]; exists {
 		t.Fatal("stale LinearHashes entry was not cleared on save")
+	}
+}
+
+func TestSaveAndLoadRoundTripsSavedAt(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "test-cache.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer store.Close()
+
+	want := time.Date(2026, time.January, 2, 3, 4, 5, 123456789, time.UTC)
+	if err := store.Save(context.Background(), Snapshot{SavedAt: want}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	loaded, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !loaded.SavedAt.Equal(want) {
+		t.Fatalf("SavedAt = %s, want %s", loaded.SavedAt, want)
 	}
 }

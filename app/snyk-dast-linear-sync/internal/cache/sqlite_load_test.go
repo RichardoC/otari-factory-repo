@@ -63,8 +63,11 @@ func (c *stubConn) QueryContext(_ context.Context, query string, _ []driver.Name
 	switch {
 	case strings.Contains(query, "sync_meta"):
 		return &stubRows{
-			columns:           []string{"value"},
-			fixture:           [][]driver.Value{{"sig-v1"}},
+			columns: []string{"key", "value"},
+			fixture: [][]driver.Value{
+				{"schema_signature", "sig-v1"},
+				{"saved_at", "2026-01-02T03:04:05Z"},
+			},
 			failWhenExhausted: c.failingTable == "sync_meta",
 		}, nil
 	case strings.Contains(query, "snyk_dast_findings"):

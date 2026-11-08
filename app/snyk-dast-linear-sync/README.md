@@ -505,6 +505,7 @@ avoid daily cache churn.
 
 The cache lives in SQLite and stores:
 
+- the UTC time the snapshot was saved, reported as `saved_at` in cache logs
 - a schema signature for the managed issue format
 - a normalized hash for each Snyk DAST finding
 - a normalized hash for each managed Linear issue

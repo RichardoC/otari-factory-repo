@@ -130,7 +130,9 @@ func capPlanBrief(parts []string, max int) string {
 		var dropped []string
 		offset := 0
 		for _, part := range parts {
-			if offset+len(part) > cut {
+			// An empty part (a section that gathered nothing) has no
+			// heading; it must never add an empty name to the note.
+			if part != "" && offset+len(part) > cut {
 				heading, _, _ := strings.Cut(part, "\n")
 				dropped = append(dropped, heading)
 			}
@@ -452,9 +454,11 @@ func planIssueNumberOfURL(issueURL string) string {
 	return strconv.Itoa(n)
 }
 
-// planOutputContract ends the brief with the machine-parsed output format —
-// the same contract plan-instructions.md states, so the parser's shape is
-// the last thing the planner reads before it writes.
+// planOutputContract renders the machine-parsed output format — the same
+// contract plan-instructions.md states — as its own "# Output contract"
+// section. runPlanBrief places it ahead of the bulky repository and issue
+// windows, so the whole-brief cap never cuts the parser's shape out of the
+// brief, and the proposal cap it carries travels with it.
 func planOutputContract() string {
 	return fmt.Sprintf("# Output contract\n\n"+
 		"Write up to %d proposals, one section each, in exactly this shape. "+

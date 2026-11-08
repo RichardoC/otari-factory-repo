@@ -34,7 +34,8 @@ Hard limits:
 - Never propose anything that touches secrets, tokens or credentials — not
   even to improve how they are handled. Name such a gap in the proposal's
   Problem field only if a fix that needs no new secret handling exists.
-- Propose at most 5 issues (or the cap stated at the end of this brief).
+- Propose at most 5 issues (or the cap stated in the brief's `# Output contract`
+  section, above the repository and issue listings).
 - Never propose work that duplicates an open issue listed below.
 - Before proposing a test, search the `*_test.go` files for one that already
   covers the behaviour, and name what is missing. A subcommand no workflow

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -65,8 +67,20 @@ func newTestRepo(t *testing.T) *testRepo {
 
 func (r *testRepo) tree(files map[string]string) string {
 	r.t.Helper()
-	names := make([]string, 0, len(files))
+	// Split the files into blobs at this level and subtrees below it, so
+	// tests can commit long conflicted paths (one over 255 bytes does not
+	// fit in a single directory component, but fits a nested path).
+	sub := map[string]map[string]string{}
+	var names []string
 	for name := range files {
+		if i := strings.IndexByte(name, '/'); i >= 0 {
+			dir, rest := name[:i], name[i+1:]
+			if sub[dir] == nil {
+				sub[dir] = map[string]string{}
+			}
+			sub[dir][rest] = files[name]
+			continue
+		}
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -75,7 +89,22 @@ func (r *testRepo) tree(files map[string]string) string {
 		blob := strings.TrimSpace(gitTestIn(r.t, r.dir, files[name], "hash-object", "-w", "--stdin"))
 		buf.WriteString("100644 blob " + blob + "\t" + name + "\n")
 	}
+	for _, dir := range sortedKeys(sub) {
+		buf.WriteString("040000 tree " + r.tree(sub[dir]) + "\t" + dir + "\n")
+	}
 	return strings.TrimSpace(gitTestIn(r.t, r.dir, buf.String(), "mktree"))
+}
+
+// sortedKeys returns the map keys in sorted order, so tree building is
+// deterministic (mktree normalises the order itself, but stable input keeps
+// failures readable).
+func sortedKeys(m map[string]map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (r *testRepo) commitTree(tree string, parents []string, message string) string {
@@ -574,6 +603,206 @@ func TestRunMergeDegradesUnusableConflictPathToNoMerge(t *testing.T) {
 	}
 	if !strings.Contains(string(runState), "state=none") || !strings.Contains(string(runState), "cannot name") {
 		t.Fatalf("no-merge reason = %q; want the unusable-path refusal", runState)
+	}
+}
+
+// Issue #33: the 64 KB probe must size the recorded Workflows value the way
+// the write will, and the recorded value is only settled after
+// checkMergeGated -- so the probe sizes the longer literal (false, one byte
+// more than true). A merge whose info is exactly at the reader limit when
+// sized with false must degrade to no merge: sized with the shorter true it
+// would pass the probe and then write a byte over 64 KB, a merge info the
+// reader refuses and publish treats as fatal on every rerun (issue #21).
+func TestRunMergeDegradesMergeInfoAt64KBProbe(t *testing.T) {
+	r := newTestRepo(t)
+	// Conflicted paths of ~490 bytes each: 200 paths of at most 255 bytes
+	// cannot reach 64 KB, and usableMergePath rejects anything over 512.
+	names := make([]string, 130)
+	for i := range names {
+		// Two long components, both under the 255-byte per-name limit:
+		// ~488 bytes each, near what usableMergePath accepts.
+		names[i] = fmt.Sprintf("d%03d", i) + strings.Repeat("d", 240) + "/" + strings.Repeat("p", 242) + "f"
+	}
+	// The probe runMerge builds, byte for byte: same MarshalIndent form, the
+	// commit and tree ids fixed 40-hex length (real or placeholder alike).
+	probeSize := func(files []string) int {
+		probe := mergeInfo{Kind: mergeKindConflicted, Commit: strings.Repeat("0", 40), Base: strings.Repeat("b", 40), Onto: strings.Repeat("c", 40), Tree: strings.Repeat("0", 40), Files: files, Workflows: false}
+		data, err := json.MarshalIndent(probe, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(data) + 1
+	}
+	// Widen every name by the same pad until the probe is less than one
+	// byte per name under the limit, then widen one name per missing byte:
+	// one extra byte in one name is one extra byte in the record.
+	target := 1<<16 + 1 // len(data)+1 must be over the 65536 the reader accepts
+	size := probeSize(names)
+	if size > target {
+		t.Fatalf("starting names already size the probe over the limit: %d", size)
+	}
+	if step := (target - size) / len(names); step > 0 {
+		for i, n := range names {
+			names[i] = n + strings.Repeat("x", step)
+		}
+		size = probeSize(names)
+	}
+	for i := 0; i < target-size; i++ {
+		names[i] += "x"
+	}
+	for i, n := range names {
+		if len(n) > 512 {
+			t.Fatalf("name %d is %d bytes, over what usableMergePath accepts", i, len(n))
+		}
+	}
+	if got := probeSize(names); got != target {
+		t.Fatalf("probe size = %d, want exactly %d", got, target)
+	}
+	baseFiles, prFiles, mainFiles := make(map[string]string), make(map[string]string), make(map[string]string)
+	for _, n := range names {
+		baseFiles[n], prFiles[n], mainFiles[n] = "a\nb\nc\n", "a\npr\nc\n", "a\nbase\nc\n"
+	}
+	base := r.commit("base", baseFiles)
+	pr := r.commit("pr change", prFiles, base)
+	mainTip := r.commit("main change", mainFiles, base)
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	r.withOrigin("pr", "main")
+	baseFile, infoFile, _ := artifactDir(t)
+
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != "none" {
+		t.Fatalf("runMerge: state=%q err=%v; want none (a probe sized with the shorter true would have merged)", got.State, err)
+	}
+	if r.head() != pr {
+		t.Fatal("the branch moved without a merge")
+	}
+	if _, err := os.Stat(infoFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("merge info written for a merge that was not made: %v", err)
+	}
+	runState, err := os.ReadFile(runStateFile(infoFile))
+	if err != nil {
+		t.Fatalf("no no-merge record: %v", err)
+	}
+	if !strings.Contains(string(runState), "state=none") || !strings.Contains(string(runState), "64 KB") {
+		t.Fatalf("no-merge reason = %q; want the 64 KB refusal", runState)
+	}
+}
+
+// Issue #33: the no-merge reason leads with its instruction because
+// mergeNotMade caps it at 300 bytes -- a long base branch name must not be
+// able to cut "a person must merge the branch by hand" out of what the
+// agent is told.
+func TestRunMergeReasonKeepsInstructionUnderLongBaseRef(t *testing.T) {
+	r := newTestRepo(t)
+	base := r.commit("base", map[string]string{"-flag.txt": "a\nb\nc\n"})
+	pr := r.commit("pr change", map[string]string{"-flag.txt": "a\npr\nc\n"}, base)
+	mainTip := r.commit("main change", map[string]string{"-flag.txt": "a\nbase\nc\n"}, base)
+	// A base branch whose name alone pushes the reason past the cap (each
+	// path component stays under the 255-byte ref-file limit).
+	longRef := strings.Repeat("br/", 80) + "end"
+	r.setBranch("pr", pr)
+	r.setBranch(longRef, mainTip)
+	r.onBranch("pr")
+	r.withOrigin("pr", longRef)
+	baseFile, infoFile, _ := artifactDir(t)
+
+	got, err := runMerge(r.dir, "pr", longRef, baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != "none" {
+		t.Fatalf("runMerge: state=%q err=%v; want none", got.State, err)
+	}
+	runState, err := os.ReadFile(runStateFile(infoFile))
+	if err != nil {
+		t.Fatalf("no no-merge record: %v", err)
+	}
+	reason := ""
+	for _, line := range strings.Split(string(runState), "\n") {
+		if strings.HasPrefix(line, "reason=") {
+			reason = strings.TrimPrefix(line, "reason=")
+		}
+	}
+	if reason == "" {
+		t.Fatalf("no reason recorded: %q", runState)
+	}
+	if len(reason) > maxNoMergeReasonBytes {
+		t.Fatalf("reason is %d bytes, over the %d cap", len(reason), maxNoMergeReasonBytes)
+	}
+	if !strings.HasPrefix(reason, "a person must merge the branch by hand") {
+		t.Fatalf("the long base ref cut the instruction out of the reason: %q", reason)
+	}
+}
+
+// Issue #33: the conflicted-files notice is built from unquoted git paths,
+// which can carry non-ASCII bytes and control characters. It is stripped of
+// control characters (a ::notice:: line must not carry them) and capped with
+// capUTF8, so the cut cannot split a multi-byte character.
+func TestRunMergeNoticeListStripsControlAndCapsOnRuneBoundary(t *testing.T) {
+	r := newTestRepo(t)
+	baseFiles := map[string]string{
+		"ctl\x01x.txt":                     "a\nb\nc\n",
+		strings.Repeat("é", 100) + "1.txt": "a\nb\nc\n",
+		strings.Repeat("é", 100) + "2.txt": "a\nb\nc\n",
+		strings.Repeat("é", 100) + "3.txt": "a\nb\nc\n",
+	}
+	prFiles := map[string]string{
+		"ctl\x01x.txt":                     "a\npr\nc\n",
+		strings.Repeat("é", 100) + "1.txt": "a\npr\nc\n",
+		strings.Repeat("é", 100) + "2.txt": "a\npr\nc\n",
+		strings.Repeat("é", 100) + "3.txt": "a\npr\nc\n",
+	}
+	mainFiles := map[string]string{
+		"ctl\x01x.txt":                     "a\nbase\nc\n",
+		strings.Repeat("é", 100) + "1.txt": "a\nbase\nc\n",
+		strings.Repeat("é", 100) + "2.txt": "a\nbase\nc\n",
+		strings.Repeat("é", 100) + "3.txt": "a\nbase\nc\n",
+	}
+	base := r.commit("base", baseFiles)
+	pr := r.commit("pr change", prFiles, base)
+	mainTip := r.commit("main change", mainFiles, base)
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	r.withOrigin("pr", "main")
+	baseFile, infoFile, _ := artifactDir(t)
+
+	// Capture the ::notice:: lines runMerge prints on stdout.
+	old := os.Stdout
+	rd, wr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = wr
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	wr.Close()
+	os.Stdout = old
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, rd); err != nil {
+		t.Fatal(err)
+	}
+	if err != nil || got.State != mergeKindConflicted {
+		t.Fatalf("runMerge: state=%q err=%v; want conflicted", got.State, err)
+	}
+	notice := buf.String()
+	if !strings.Contains(notice, "::notice::") {
+		t.Fatalf("no notice printed:\n%s", notice)
+	}
+	if strings.ContainsRune(notice, 1) {
+		t.Fatalf("the notice carries a raw control character:\n%q", notice)
+	}
+	if !utf8.ValidString(notice) {
+		t.Fatalf("the notice is not valid UTF-8 (a cut split a character):\n%q", notice)
+	}
+	// The three long names alone are over the 400-byte cap, so the list is
+	// cut -- on a rune boundary, ending in the ellipsis.
+	const listMark = "CodeAF must resolve: "
+	i := strings.Index(notice, listMark)
+	if i < 0 {
+		t.Fatalf("no conflicted-file list in the notice:\n%s", notice)
+	}
+	list := notice[i+len(listMark):]
+	if len(list) > 400+3 || !strings.HasSuffix(list, "…\n") {
+		t.Fatalf("the list was not capped on a rune boundary (%d bytes):\n%q", len(list), list)
 	}
 }
 

@@ -916,6 +916,15 @@ jobs:
             elif [ "$ready" = true ]; then
               gh pr ready "$pr" || true
             fi
+            # The push moved the pull request's head (issue #5): any
+            # codeaf-review-passed on it was given to an earlier head commit
+            # and no longer describes this code — and an update that never
+            # reaches a review (an early stop publishes as a draft and gets
+            # no codeaf-review-needed while the run is not ready) would
+            # otherwise leave the old pass standing. Withdraw it; the next
+            # clean review re-adds it. Kept identical to the harness's
+            # review-passed label const. Best effort.
+            "$HARNESS" gh-retry -- gh pr edit "$pr" --remove-label codeaf-review-passed || true
           fi
           # A workflow change published on the policy alone, with no
           # maintainer: marked so it is merged only after the independent
@@ -1030,6 +1039,15 @@ jobs:
               # a person (or a merge rule) can merge with confidence.
               gh label create "$label" --color 0e8a16 --description "Independent CodeAF review found no blocking findings" || true
               "$HARNESS" gh-retry -- gh pr edit "$NUMBER" --add-label "$label"
+              ;;
+            *)
+              # Every outcome other than a clean pass withdraws the pass
+              # label (issue #5): report-only — no result, an early stop, an
+              # unrecognized severity, a draft, or the fix budget spent —
+              # must leave no codeaf-review-passed on the PR, exactly as the
+              # fix branch above already drops it. Best effort: the review
+              # must not fail publishing over a label.
+              "$HARNESS" gh-retry -- gh pr edit "$NUMBER" --remove-label "$label" || true
               ;;
           esac
 

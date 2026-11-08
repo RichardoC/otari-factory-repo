@@ -938,6 +938,14 @@ func reviewerModel(cfg Config, workerID string) (Model, error) {
 //     request ready, and the review can then run again;
 //   - otherwise: label — a clean pass.
 //
+// The action is the label contract (issue #5): `label` is the only outcome
+// that adds codeaf-review-passed, and every other action — `fix` and every
+// report-only path above — means the label must not be on the pull request.
+// The workflow withdraws it for any action other than label, and publish
+// withdraws it when it pushes an update to the pull request: a pass given to
+// one head commit never outlives the code it was given for, and the next
+// clean review re-adds it.
+//
 // The comment body is built only from fixed sentences, counters and findings
 // whose remote-derived strings are escaped and capped; it never carries the
 // run-report marker, so it is never mistaken for a run report, and no raw

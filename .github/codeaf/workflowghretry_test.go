@@ -21,6 +21,7 @@ package main
 // mentions a call is not scanned as one.
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -199,4 +200,86 @@ func unwrapOne(t *testing.T, path, wrapped, bare string) string {
 		t.Fatalf("%s no longer spells the call as %q; update the negative proof", path, wrapped)
 	}
 	return strings.Replace(text, wrapped, bare, 1)
+}
+
+// reviewPassedWithdrawalProblems reports every way a workflow's text fails
+// the label contract of issue #5: `label` is the only review outcome that
+// may leave codeaf-review-passed on the pull request, so the review-findings
+// step must withdraw it outside the label branch (the fix branch and a
+// catch-all covering every report-only outcome), and the publish step must
+// withdraw it when its push moves an existing pull request's head — an
+// update that never reaches a review must not leave an old pass standing.
+func reviewPassedWithdrawalProblems(text string) []string {
+	const withdraw = `"$HARNESS" gh-retry -- gh pr edit "$NUMBER" --remove-label "$label" || true`
+	const publishWithdraw = `"$HARNESS" gh-retry -- gh pr edit "$pr" --remove-label codeaf-review-passed || true`
+	var bad []string
+	findings, ok := stepBetween(text, "Independent review findings", "Open the proposed issues")
+	if !ok {
+		return []string{"the review-findings step is missing"}
+	}
+	if n := strings.Count(findings, withdraw); n != 2 {
+		bad = append(bad, fmt.Sprintf("the review-findings step withdraws the pass label %d times, want twice: the fix branch and a catch-all for every non-passing outcome", n))
+	}
+	_, arms, _ := strings.Cut(findings, "label)")
+	_, catchAll, found := strings.Cut(arms, "*)")
+	if !found || !strings.Contains(catchAll, withdraw) {
+		bad = append(bad, "the review-findings catch-all arm does not withdraw the pass label; a report-only outcome leaves an old pass standing")
+	}
+	publish, ok := stepBetween(text, "Push and open/update PR", "Continue or hand over")
+	if !ok {
+		return append(bad, "the publish step is missing")
+	}
+	flips := strings.Index(publish, "gh pr ready --undo")
+	got := strings.Index(publish, publishWithdraw)
+	if got < 0 {
+		bad = append(bad, "the publish step never withdraws the pass label when it pushes an update to a pull request")
+	} else if flips >= 0 && got < flips {
+		bad = append(bad, "the publish withdrawal is not in the existing-PR branch after the draft flips")
+	}
+	return bad
+}
+
+// stepBetween returns the workflow text between two step names, false when
+// either name is missing.
+func stepBetween(text, from, to string) (string, bool) {
+	i := strings.Index(text, from)
+	if i < 0 {
+		return "", false
+	}
+	j := strings.Index(text[i+len(from):], to)
+	if j < 0 {
+		return "", false
+	}
+	return text[i : i+len(from)+j], true
+}
+
+// TestWorkflowWithdrawsReviewPassedLabel pins the workflow half of issue #5
+// against the committed YAML, read as text like the other workflow tests,
+// and proves the checks catch the class: dropping either withdrawal must
+// fail them.
+func TestWorkflowWithdrawsReviewPassedLabel(t *testing.T) {
+	path := filepath.Join("..", "workflows", "codeaf.yml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	text := string(data)
+	if bad := reviewPassedWithdrawalProblems(text); len(bad) > 0 {
+		t.Fatalf("codeaf.yml does not withdraw codeaf-review-passed as issue #5 asks: %s", strings.Join(bad, "; "))
+	}
+	// Drop the catch-all withdrawal (the last of the two identical lines)
+	// and the structural check must name it.
+	catchAllLine := `"$HARNESS" gh-retry -- gh pr edit "$NUMBER" --remove-label "$label" || true` + "\n"
+	i := strings.LastIndex(text, catchAllLine)
+	if i < 0 {
+		t.Fatal("the catch-all withdrawal line is missing verbatim; update the negative proof")
+	}
+	if bad := reviewPassedWithdrawalProblems(text[:i] + text[i+len(catchAllLine):]); len(bad) == 0 {
+		t.Error("dropping the catch-all withdrawal produced no violation")
+	}
+	// Drop the publish withdrawal and the check must name it too.
+	publishLine := `"$HARNESS" gh-retry -- gh pr edit "$pr" --remove-label codeaf-review-passed || true` + "\n"
+	if bad := reviewPassedWithdrawalProblems(strings.Replace(text, publishLine, "", 1)); len(bad) == 0 {
+		t.Error("dropping the publish withdrawal produced no violation")
+	}
 }

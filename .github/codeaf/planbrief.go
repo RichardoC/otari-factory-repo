@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // Section caps for the plan brief. Each is its own constant so a hostile or
@@ -86,6 +87,11 @@ func runPlanBrief() error {
 	}
 	gh := newGitHub()
 	parts := []string{budgetLine(), string(standing)}
+	// Keep the planner's best evidence and its machine-parsed output
+	// contract ahead of the bulky repository and issue windows. The whole-
+	// brief cap can then truncate only lower-priority context.
+	parts = append(parts, planRunReports(gh))
+	parts = append(parts, planOutputContract())
 	parts = append(parts, planRepoFiles())
 	// Issue #139: the planner grounds its proposals in every app's rules,
 	// not in the areas of one issue.
@@ -95,15 +101,47 @@ func runPlanBrief() error {
 	parts = append(parts, planOpenIssues(gh))
 	parts = append(parts, planClosedIssues(gh))
 	parts = append(parts, planClosedPulls(gh))
-	parts = append(parts, planRunReports(gh))
-	parts = append(parts, planOutputContract())
 
-	brief := capBrief(strings.Join(parts, "\n\n")+"\n", maxBriefBytes)
+	brief := capPlanBrief(parts, maxBriefBytes)
 	fmt.Print(brief)
 	if err := os.MkdirAll(filepath.Dir(briefPath), 0o755); err != nil {
 		return err
 	}
 	return os.WriteFile(briefPath, []byte(brief), 0o644)
+}
+
+// capPlanBrief applies the whole-brief cap without cutting the protected
+// report and output sections, which runPlanBrief places first. Unlike
+// capBrief, its note names every section that was truncated or dropped.
+func capPlanBrief(parts []string, max int) string {
+	brief := strings.Join(parts, "\n\n") + "\n"
+	if len(brief) <= max {
+		return brief
+	}
+	note := ""
+	for {
+		cut := max - len(note)
+		if cut < 0 {
+			cut = 0
+		}
+		for cut > 0 && !utf8.RuneStart(brief[cut]) {
+			cut--
+		}
+		var dropped []string
+		offset := 0
+		for _, part := range parts {
+			if offset+len(part) > cut {
+				heading, _, _ := strings.Cut(part, "\n")
+				dropped = append(dropped, heading)
+			}
+			offset += len(part) + len("\n\n")
+		}
+		newNote := fmt.Sprintf("\n\n(brief truncated at %d bytes; sections truncated or dropped: %s)\n", max, strings.Join(dropped, ", "))
+		if newNote == note {
+			return brief[:cut] + note
+		}
+		note = newNote
+	}
 }
 
 // planRepoFiles embeds the working tree's README.md and AGENTS.md, capped.

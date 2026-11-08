@@ -377,17 +377,6 @@ func readMergeInfo(path string) (*mergeInfo, error) {
 	return &info, nil
 }
 
-// workflowChanges lists the files under .github/workflows/ that differ
-// between from and to. Bringing such changes into a PR branch makes the push
-// a workflow change, which GitHub refuses from GITHUB_TOKEN ("refusing to
-// allow a GitHub App to create or update workflow"): a merge that carries any
-// goes through the maintainer-approval gate instead of being skipped (issue
-// #16) -- recorded in merge-info.json on the run side, checked against
-// HARNESS_APPROVED on the publish side.
-func workflowChanges(dir, from, to string) ([]string, error) {
-	return diffNameOnly(dir, from, to, ".github/workflows/")
-}
-
 // diffNameOnly lists the paths one git diff names, one per line, under the
 // given pathspec. A name may contain spaces (#343), so splitting on
 // whitespace would turn one file into two paths that do not exist; git
@@ -722,11 +711,11 @@ func publishMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile, stateFile
 	}
 	out = mergeOutcome{State: "none"}
 	if baseRef == "" {
-		log.Printf("merge-default: no base branch named; pushing the patch alone")
+		mergeSkipped("no base branch named; pushing the patch alone")
 		return out, nil
 	}
 	if err := fetchRef(dir, baseRef); err != nil {
-		log.Printf("merge-default: could not fetch %s (%v); pushing the patch without bringing it in", baseRef, err)
+		mergeSkipped("could not fetch %s (%v); pushing the patch without bringing it in", baseRef, err)
 		return out, nil
 	}
 	onto, err := revParse(dir, "FETCH_HEAD")
@@ -738,7 +727,7 @@ func publishMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile, stateFile
 	}
 	cmp, err := compare(head, onto)
 	if err != nil {
-		log.Printf("merge-default: could not compare the branch with %s (%v); pushing the patch without a merge", baseRef, err)
+		mergeSkipped("could not compare the branch with %s (%v); pushing the patch without a merge", baseRef, err)
 		return out, nil
 	}
 	switch {
@@ -759,7 +748,7 @@ func publishMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile, stateFile
 		// merge base is the head itself, so the branch made no change since
 		// the branch point and the overlap is always empty.)
 		if wf, err := gatedGitHubChanges(dir, head, onto); (err != nil || len(wf) > 0) && !mergeApproved() {
-			log.Printf("merge-default: %s changed gated .github/ paths (%v); without a maintainer approval the push token cannot carry them, so pushing the patch without the merge", baseRef, wf)
+			mergeSkipped("%s changed gated .github/ paths (%v); without a maintainer approval the push token cannot carry them, so pushing the patch without the merge", baseRef, wf)
 			return out, nil
 		}
 		tree, _, conflicted, err := mergeTree(dir, head, head, onto)
@@ -767,12 +756,22 @@ func publishMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile, stateFile
 			// ours is the merge base here, so the merge cannot conflict;
 			// anything else is a degraded host state, and the patch goes
 			// alone as before #57.
-			log.Printf("merge-default: could not compute the behind-branch merge (%v); pushing the patch without one", err)
+			mergeSkipped("could not compute the behind-branch merge (%v); pushing the patch without one", err)
 			return out, nil
 		}
 		commit, err := commitMerge(dir, tree, head, onto, fmt.Sprintf("Merge %s into %s", baseRef, branch))
 		if err != nil {
 			return out, err
+		}
+		// The same approval rule as recreateMerge: a merge that changes
+		// any gated .github/ path relative to the PR head needs a
+		// maintainer's approval, even when the head..base-tip comparison
+		// above found none -- merge-ort follows renames, so the merge can
+		// land gated content that comparison does not see. An error counts
+		// as changed, as in recreateMerge.
+		if carried, cerr := gatedGitHubChanges(dir, head, commit); (cerr != nil || len(carried) > 0) && !mergeApproved() {
+			mergeSkipped("%s's merge changes gated .github/ paths relative to the PR head (paths %v, error %v); without a maintainer approval the push token cannot carry them, so pushing the patch without the merge", baseRef, carried, cerr)
+			return out, nil
 		}
 		// Issue #16, widened by issue #20: every gated .github/ path the
 		// merge changes relative to the PR head must be byte-for-byte what
@@ -784,7 +783,7 @@ func publishMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile, stateFile
 		// the run side now skips it. Checked before the reset, so the
 		// branch stays untouched.
 		if err := checkMergeGated(dir, head, commit, onto); err != nil {
-			log.Printf("merge-default: the merge of %s would carry gated .github/ changes the base tip does not have (%v); pushing the patch without the merge", baseRef, err)
+			mergeSkipped("the merge of %s would carry gated .github/ changes the base tip does not have (%v); pushing the patch without the merge", baseRef, err)
 			return out, nil
 		}
 		if err := gitRun(dir, "reset", "--hard", commit); err != nil {
@@ -796,16 +795,16 @@ func publishMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile, stateFile
 	case cmp.Status == "diverged":
 		// handled below, over the compare API's merge base
 	default:
-		log.Printf("merge-default: unexpected compare status %q; pushing the patch without a merge", cmp.Status)
+		mergeSkipped("unexpected compare status %q; pushing the patch without a merge", cmp.Status)
 		return out, nil
 	}
 	if cmp.MergeBase == "" || !isSHA(cmp.MergeBase) {
-		log.Printf("merge-default: the compare API named no merge base; pushing the patch without a merge")
+		mergeSkipped("the compare API named no merge base; pushing the patch without a merge")
 		return out, nil
 	}
 	base := cmp.MergeBase
 	if err := fetchCommit(dir, base); err != nil {
-		log.Printf("merge-default: could not fetch the merge base %s (%v); pushing the patch without a merge", shortSHA(base), err)
+		mergeSkipped("could not fetch the merge base %s (%v); pushing the patch without a merge", shortSHA(base), err)
 		return out, nil
 	}
 	// Issue #171: a patch that would re-publish the base's own changes is a
@@ -826,37 +825,45 @@ func publishMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile, stateFile
 	if overlap, err := overlappingGatedPaths(dir, base, onto, head); err != nil {
 		log.Printf("merge-default: could not tell whether the branch and %s edited the same gated .github/ files (%v); the overlap check is skipped", baseRef, err)
 	} else if len(overlap) > 0 {
-		log.Printf("merge-default: %s changed .github/ file(s) %s that the branch also edits; pushing the patch without the merge (a person must merge it by hand)", baseRef, strings.Join(overlap, ", "))
+		mergeSkipped("%s changed .github/ file(s) %s that the branch also edits; pushing the patch without the merge (a person must merge it by hand)", baseRef, strings.Join(overlap, ", "))
 		return out, nil
 	}
 	// Issue #16: with a maintainer's approval the merge goes through -- the
 	// push step then uses the GitHub App token, which can carry the gated
 	// .github/ changes. Without one the patch is pushed alone, as before.
 	if wf, err := gatedGitHubChanges(dir, base, onto); (err != nil || len(wf) > 0) && !mergeApproved() {
-		log.Printf("merge-default: %s changed gated .github/ paths since the branch point (%v); without a maintainer approval the push token cannot carry them, so pushing the patch without the merge", baseRef, wf)
+		mergeSkipped("%s changed gated .github/ paths since the branch point (%v); without a maintainer approval the push token cannot carry them, so pushing the patch without the merge", baseRef, wf)
 		return out, nil
 	}
 	tree, _, conflicted, err := mergeTree(dir, base, head, onto)
 	if err != nil {
-		log.Printf("merge-default: could not compute the merge (%v); pushing the patch without one", err)
+		mergeSkipped("could not compute the merge (%v); pushing the patch without one", err)
 		return out, nil
 	}
 	if conflicted {
 		// A conflict CodeAF never saw. Publishing a merge whose files carry
 		// markers would push an unresolved merge, so the patch goes alone:
 		// the PR stays dirty, and the next run does the conflicted flow.
-		log.Printf("merge-default: merging %s would conflict; pushing the patch without the merge", baseRef)
+		mergeSkipped("merging %s would conflict; pushing the patch without the merge", baseRef)
 		return out, nil
 	}
 	commit, err := commitMerge(dir, tree, head, onto, fmt.Sprintf("Merge %s into %s", baseRef, branch))
 	if err != nil {
 		return out, err
 	}
+	// The same approval rule as on the behind branch above and in
+	// recreateMerge: gated .github/ paths the merge changes relative to the
+	// PR head need a maintainer's approval, with an error counting as
+	// changed.
+	if carried, cerr := gatedGitHubChanges(dir, head, commit); (cerr != nil || len(carried) > 0) && !mergeApproved() {
+		mergeSkipped("%s's merge changes gated .github/ paths relative to the PR head (paths %v, error %v); without a maintainer approval the push token cannot carry them, so pushing the patch without the merge", baseRef, carried, cerr)
+		return out, nil
+	}
 	// The same per-path check as on the behind branch above -- and the same
 	// patch-alone outcome on a refusal (issue #20) -- before the reset so
 	// the branch stays untouched.
 	if err := checkMergeGated(dir, head, commit, onto); err != nil {
-		log.Printf("merge-default: the merge of %s would carry gated .github/ changes the base tip does not have (%v); pushing the patch without the merge", baseRef, err)
+		mergeSkipped("the merge of %s would carry gated .github/ changes the base tip does not have (%v); pushing the patch without the merge", baseRef, err)
 		return out, nil
 	}
 	if err := gitRun(dir, "reset", "--hard", commit); err != nil {
@@ -870,7 +877,9 @@ func publishMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile, stateFile
 }
 
 // mergeWorkflowsRouting reads, for the run job's packaging step, whether the
-// recorded merge carries the base branch's workflow changes (issue #16):
+// recorded merge carries the base branch's gated .github/ changes -- every
+// path under .github/ outside .github/codeaf/ since issue #20, before it the
+// workflow paths only (issue #16):
 // merge info through the validating reader, so the workflow never parses the
 // file in shell. A missing file reads false; one that exists but does not
 // validate is an error, not a silent false.
@@ -1006,6 +1015,18 @@ func mergeApproved() bool {
 	return envOr("HARNESS_APPROVED", "") == "true"
 }
 
+// mergeSkipped reports a fallback merge publish declined to make: the patch
+// goes alone and the base is not merged in. The log line is for the run's
+// records; when the run's maintainer approved the merge, the ::warning::
+// also reaches the job log, so the approver sees the base was not merged
+// after all instead of reading a green run as if it had been.
+func mergeSkipped(format string, args ...any) {
+	log.Printf("merge-default: %s", fmt.Sprintf(format, args...))
+	if mergeApproved() {
+		fmt.Printf("::warning::the base merge was skipped: %s\n", fmt.Sprintf(format, args...))
+	}
+}
+
 // recreateMerge rebuilds the merge the run job committed, from the same two
 // parents, and refuses unless everything checks out: the recorded base is the
 // branch head publish fetched, the recorded commit is the run's base commit,
@@ -1026,7 +1047,7 @@ func mergeApproved() bool {
 func recreateMerge(dir, branch, baseRef string, info *mergeInfo, baseCommit, head string, compare compareFunc) (mergeOutcome, error) {
 	out := mergeOutcome{State: "none"}
 	if info.Workflows && !mergeApproved() {
-		return out, errors.New("the recorded merge carries the base branch's workflow changes, and publishing one needs a maintainer's approval of the codeaf-harness environment (HARNESS_APPROVED, checked through the API); no maintainer approved this run, so refusing the merge")
+		return out, errors.New("the recorded merge carries the base branch's gated .github/ changes, and publishing one needs a maintainer's approval of the codeaf-harness environment (HARNESS_APPROVED, checked through the API); no maintainer approved this run, so refusing the merge")
 	}
 	if info.Base != head {
 		return out, fmt.Errorf("the merge info names base %s but the branch head is %s; refusing a merge made against another commit", shortSHA(info.Base), shortSHA(head))
@@ -1127,12 +1148,12 @@ func recreateMerge(dir, branch, baseRef string, info *mergeInfo, baseCommit, hea
 	if headCarries && !info.Workflows {
 		return out, errors.New("the run recorded that its merge carries no gated .github/ changes, but the merge changes gated paths under .github/ relative to the branch head; the run lied about its merge, so refusing it even if a maintainer approved")
 	}
-	// Carrying workflow changes relative to the head (recomputed or
+	// Carrying gated .github/ changes relative to the head (recomputed or
 	// recorded) needs the maintainer's approval, whatever the run recorded:
 	// the push then uses the GitHub App token, which GitHub lets carry
 	// workflow files.
 	if (headCarries || info.Workflows) && !mergeApproved() {
-		return out, errors.New("the merge carries workflow changes relative to the branch head, and publishing one needs a maintainer's approval of the codeaf-harness environment (HARNESS_APPROVED, checked through the API); no maintainer approved this run, so refusing the merge")
+		return out, errors.New("the merge carries gated .github/ changes relative to the branch head, and publishing one needs a maintainer's approval of the codeaf-harness environment (HARNESS_APPROVED, checked through the API); no maintainer approved this run, so refusing the merge")
 	}
 	// The per-path byte check runs whatever the flags say: for each gated
 	// .github/ path the merge changes relative to the PR head, its content

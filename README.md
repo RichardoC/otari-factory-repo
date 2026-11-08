@@ -463,7 +463,7 @@ patch is still pushed alone without approval, and the base is merged in as
 above once approved.
 
 Why every `.github/` path outside `.github/codeaf/` and not just the
-workflows (the owner's decision, issue #20): a PR's *own* `.github/` edits
+workflows (a design decision made in issue #20): a PR's *own* `.github/` edits
 were already gated at the patch level, but a base merge carried the base
 branch's copies of `CODEOWNERS`, `.github/actions/`, `dependabot.yml` and
 the rest unchecked. That was low-risk while the base was the default branch

@@ -1211,8 +1211,8 @@ func TestPublishApprovedWorkflowsMerge(t *testing.T) {
 	if wf := gitTest(t, pub, "cat-file", "blob", head+":.github/workflows/ci.yml"); wf != "on: push\n" {
 		t.Fatalf("merge ci.yml = %q, want the base branch's", wf)
 	}
-	if wf, err := workflowChanges(pub, head, mainTip); err != nil || len(wf) != 0 {
-		t.Fatalf("workflowChanges(merge, base) = %q, %v; want none", wf, err)
+	if gated, err := gatedGitHubChanges(pub, head, mainTip); err != nil || len(gated) != 0 {
+		t.Fatalf("gatedGitHubChanges(merge, base) = %q, %v; want none", gated, err)
 	}
 }
 
@@ -1234,6 +1234,76 @@ func TestPublishRefusesUnapprovedWorkflowsMerge(t *testing.T) {
 	}
 	if head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD")); head != pr {
 		t.Fatalf("publish head = %s, want the untouched branch %s", head, pr)
+	}
+}
+
+// Issue #20, review follow-up: the overlap check compares blob and mode, so
+// a path whose content the branch already changed to the base tip's but with
+// a different file mode (100644 on the base tip, 100755 on the branch) is
+// still an overlap: the merged entry would equal neither side's. The merge
+// is skipped and the patch goes alone, exactly as for differing content.
+func TestMergeOverlapCountsIdenticalBlobDifferentMode(t *testing.T) {
+	r := newTestRepo(t)
+	base := r.commitTree(r.indexTree(map[string]string{
+		"f.txt":                    "a\n",
+		"g.txt":                    "x\n",
+		".github/workflows/ci.yml": "a\nb\n",
+	}), nil, "base")
+	pr := r.commitTree(r.indexTreeExec(map[string]string{
+		"f.txt":                    "a\n",
+		"g.txt":                    "x\npr\n",
+		".github/workflows/ci.yml": "A\nb\n",
+	}, map[string]bool{".github/workflows/ci.yml": true}), []string{base}, "pr edits g.txt and ci.yml, executable")
+	mainTip := r.commitTree(r.indexTree(map[string]string{
+		"f.txt":                    "A\n",
+		"g.txt":                    "x\n",
+		".github/workflows/ci.yml": "A\nb\n",
+	}), []string{base}, "main edits f.txt and ci.yml the same content")
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+
+	// The fixture really is a mode-only difference: same blob, different mode.
+	pe := strings.Fields(gitTest(t, r.dir, "ls-tree", pr, "--", ".github/workflows/ci.yml"))
+	me := strings.Fields(gitTest(t, r.dir, "ls-tree", mainTip, "--", ".github/workflows/ci.yml"))
+	if len(pe) != 4 || len(me) != 4 || pe[2] != me[2] || pe[0] == me[0] {
+		t.Fatalf("ci.yml entries pr=%v main=%v; want one blob, two modes", pe, me)
+	}
+
+	origin := r.withOrigin("pr", "main")
+	baseFile, infoFile, stateFile := artifactDir(t)
+
+	// The run side skips the merge and records why.
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != "none" {
+		t.Fatalf("runMerge = %+v, %v; want no merge", got, err)
+	}
+	if _, err := os.Stat(infoFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("merge info written for an overlapping branch: %v", err)
+	}
+	if head := r.head(); head != pr {
+		t.Fatalf("head = %s, want the untouched branch %s", head, pr)
+	}
+	reason, err := os.ReadFile(runStateFile(infoFile))
+	if err != nil || !strings.Contains(string(reason), "ci.yml") || !strings.Contains(string(reason), "a person must merge it by hand") {
+		t.Fatalf("no-merge record = %q, %v; want the overlapping file and the by-hand instruction", reason, err)
+	}
+
+	// The diverged fallback pushes the patch alone, whatever the approval said.
+	if err := os.WriteFile(baseFile, []byte(pr+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	infoFile = filepath.Join(t.TempDir(), "absent.json")
+	for _, approved := range []string{"false", "true"} {
+		t.Setenv("HARNESS_APPROVED", approved)
+		pub := publishCheckout(t, origin, "pr")
+		got, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r))
+		if err != nil || got.State != "none" {
+			t.Fatalf("publishMerge (approved=%s) = %+v, %v; want the patch alone, no error", approved, got, err)
+		}
+		if head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD")); head != pr {
+			t.Fatalf("publish head = %s, want the untouched branch %s", head, pr)
+		}
 	}
 }
 
@@ -1563,6 +1633,56 @@ func TestPublishGatedNonWorkflowGitHubChangesNeedApproval(t *testing.T) {
 	}
 	if act := gitTest(t, pub, "cat-file", "blob", head+":.github/actions/act/action.yml"); act != "runs: 2\n" {
 		t.Fatalf("merge action.yml = %q, want the base branch's byte-for-byte", act)
+	}
+}
+
+// Issue #20, review follow-up: the diverged fallback (no merge info) applies
+// the same rule to a base that changed .github/CODEOWNERS: without a
+// maintainer's approval the patch goes alone and the branch stays untouched;
+// with one, the base's CODEOWNERS comes in byte-for-byte.
+func TestPublishDivergedFallbackCodeownersNeedsApproval(t *testing.T) {
+	r := newTestRepo(t)
+	base := r.commit("base", map[string]string{"f.txt": "a\n", "g.txt": "x\n"})
+	pr := r.commit("pr change", map[string]string{"f.txt": "a\n", "g.txt": "x\npr\n"}, base)
+	mainTip := r.commitTree(r.indexTree(map[string]string{
+		"f.txt":              "A\n",
+		"g.txt":              "x\n",
+		".github/CODEOWNERS": "* @owner\n",
+	}), []string{base}, "main edits f.txt and adds CODEOWNERS")
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	origin := r.withOrigin("pr", "main")
+
+	baseFile, _, stateFile := artifactDir(t)
+	if err := os.WriteFile(baseFile, []byte(pr+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	infoFile := filepath.Join(t.TempDir(), "absent.json")
+
+	// Without approval: the patch alone, the branch untouched.
+	pub := publishCheckout(t, origin, "pr")
+	t.Setenv("HARNESS_APPROVED", "false")
+	got, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r))
+	if err != nil || got.State != "none" {
+		t.Fatalf("publishMerge (unapproved) = %+v, %v; want no merge without approval", got, err)
+	}
+	if head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD")); head != pr {
+		t.Fatalf("publish head = %s, want the untouched branch %s", head, pr)
+	}
+
+	// With approval: the base comes in as a two-parent merge commit.
+	t.Setenv("HARNESS_APPROVED", "true")
+	got, err = publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r))
+	if err != nil || got.State != mergeKindClean {
+		t.Fatalf("publishMerge (approved) = %+v, %v; want a clean merge", got, err)
+	}
+	head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD"))
+	if parents := gitTest(t, pub, "log", "--format=%P", "-1", head); strings.Fields(parents)[0] != pr || strings.Fields(parents)[1] != mainTip {
+		t.Fatalf("merge parents = %s, want [%s %s]", parents, pr, mainTip)
+	}
+	if co := gitTest(t, pub, "cat-file", "blob", head+":.github/CODEOWNERS"); co != "* @owner\n" {
+		t.Fatalf("merge CODEOWNERS = %q, want the base branch's byte-for-byte", co)
 	}
 }
 
@@ -2064,6 +2184,13 @@ func TestRenameFollowedDirectoryGatedChangeSkipsMerge(t *testing.T) {
 // and a non-UTF-8 name would be pushed into git unvalidated either way.
 func (r *testRepo) indexTree(files map[string]string) string {
 	r.t.Helper()
+	return r.indexTreeExec(files, nil)
+}
+
+// indexTreeExec is indexTree with a set of paths recorded with mode 100755
+// instead of 100644, for tests that turn on the per-path mode comparison.
+func (r *testRepo) indexTreeExec(files map[string]string, execSet map[string]bool) string {
+	r.t.Helper()
 	blob := func(content string) string {
 		return strings.TrimSpace(gitTestIn(r.t, r.dir, content, "hash-object", "-w", "--stdin"))
 	}
@@ -2084,19 +2211,23 @@ func (r *testRepo) indexTree(files map[string]string) string {
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		env("update-index", "--add", "--cacheinfo", "100644,"+blob(files[name])+","+name)
+		mode := "100644"
+		if execSet[name] {
+			mode = "100755"
+		}
+		env("update-index", "--add", "--cacheinfo", mode+","+blob(files[name])+","+name)
 	}
 	return env("write-tree")
 }
 
-// Issue #343: workflowChanges read git's --name-only list with Fields, so a
-// workflow path containing a space was reported as two files that do not
-// exist, and merge decisions landed on the wrong path set. It pins the fix:
-// the list is split on lines, as boundedNames reads it, and the C-style
-// quoting git applies to a non-ASCII name under core.quotePath (on by
-// default) is stripped, so the change is reported as exactly the two real
-// paths.
-func TestWorkflowChangesSplitsNamesOnLines(t *testing.T) {
+// Issue #343: the --name-only list behind gatedGitHubChanges was once read
+// with Fields, so a gated path containing a space was reported as two files
+// that do not exist, and merge decisions landed on the wrong path set. It
+// pins the fix: the list is split on lines, as boundedNames reads it, and
+// the C-style quoting git applies to a non-ASCII name under core.quotePath
+// (on by default) is stripped, so the change is reported as exactly the two
+// real paths.
+func TestWorkflowNamesSplitOnLines(t *testing.T) {
 	r := newTestRepo(t)
 	base := r.commit("base", map[string]string{"f.txt": "a\n"})
 	changed := r.commitTree(r.indexTree(map[string]string{
@@ -2104,14 +2235,14 @@ func TestWorkflowChangesSplitsNamesOnLines(t *testing.T) {
 		".github/workflows/a b.yml":    "on: push\n",
 		".github/workflows/\u00e9.yml": "on: push\n",
 	}), []string{base}, "changes workflows with awkward names")
-	files, err := workflowChanges(r.dir, base, changed)
+	files, err := gatedGitHubChanges(r.dir, base, changed)
 	if err != nil {
-		t.Fatalf("workflowChanges: %v", err)
+		t.Fatalf("gatedGitHubChanges: %v", err)
 	}
 	sort.Strings(files)
 	want := []string{".github/workflows/a b.yml", ".github/workflows/\u00e9.yml"}
 	if !reflect.DeepEqual(files, want) {
-		t.Fatalf("workflowChanges = %q; want exactly %q", files, want)
+		t.Fatalf("gatedGitHubChanges = %q; want exactly %q", files, want)
 	}
 }
 

@@ -181,8 +181,8 @@ whether through prompt injection or a compromised model.
   output reads that field through the harness binary and only routes the
   job, so `publish` still checks the approval itself, and the run brief
   tells the agent never to merge or copy base-branch changes by hand,
-  because publish refuses an unverifiable replay. The widened rule is the
-  owner's decision (issue #20): a PR's own `.github/` edits were already
+  because publish refuses an unverifiable replay. The widened rule is a
+  design decision made in issue #20: a PR's own `.github/` edits were already
   gated at the patch level, but a base merge carried the base branch's
   `CODEOWNERS`, `.github/actions/`, `dependabot.yml` and the rest unchecked
   -- low-risk while the base is the default branch a human curates, a gap

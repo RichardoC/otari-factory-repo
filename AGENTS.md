@@ -173,24 +173,41 @@ whether through prompt injection or a compromised model.
   and a kind of `clean` or `conflicted`): it refuses unless the tree hash
   it recomputes matches the recorded tree, and refuses the publish if any
   previously conflicted file still contains a conflict marker. A base merge
-  that carries the base branch's workflow changes (`workflows: true` in
-  `merge-info.json`) is published only after a maintainer approves the
-  `codeaf-harness` environment: the `run` job's `touches_harness` output
-  reads that field through the harness binary and only routes the job, so
-  `publish` still checks the approval itself, and the run brief tells the
-  agent never to merge or copy base-branch changes by hand, because publish
-  refuses an unverifiable replay. publish recomputes whether the merge
-  changes a workflow path relative to the PR head (the branch's own workflow
-  edits are kept; only paths the merge changes must equal what the merged-in
-  base commit already has, content and mode), and never trusts the
-  `workflows` field -- the field only routes the job, like `touches_harness`;
-  a run that records `workflows: false` for a merge that changes workflow
-  paths relative to the head is refused even with an approval. The check
-  runs even when the base changed no workflow path, because a merge can
-  follow a rename into `.github/workflows/`; a workflow file both the branch
-  and the base changed is not merged at all -- the run leaves the merge out,
-  the brief says a person must merge it by hand, and publish pushes the
-  patch alone. The run-side merge commit is data
+  that carries gated `.github/` changes -- every path under `.github/`
+  outside `.github/codeaf/` (issue #20; before it, `.github/workflows/`
+  only) -- is published only after a maintainer approves the
+  `codeaf-harness` environment (`workflows: true` in `merge-info.json`, a
+  field name that predates the widening): the `run` job's `touches_harness`
+  output reads that field through the harness binary and only routes the
+  job, so `publish` still checks the approval itself, and the run brief
+  tells the agent never to merge or copy base-branch changes by hand,
+  because publish refuses an unverifiable replay. The widened rule is a
+  design decision made in issue #20: a PR's own `.github/` edits were already
+  gated at the patch level, but a base merge carried the base branch's
+  `CODEOWNERS`, `.github/actions/`, `dependabot.yml` and the rest unchecked
+  -- low-risk while the base is the default branch a human curates, a gap
+  once a PR targets a non-default base branch -- so the merge side applies
+  the same per-path rule as the patch side. `.github/codeaf/` stays outside
+  the merge gate, like the patch-level one: the harness is built only from
+  the default branch, so its copy on a PR branch is inert, it publishes
+  like app code, and a person reviews every PR before it merges. publish
+  recomputes whether the merge changes a gated path relative to the PR head
+  (the branch's own gated edits are kept; only paths the merge changes must
+  equal what the merged-in base commit already has, content and mode), and
+  never trusts the `workflows` field -- the field only routes the job, like
+  `touches_harness`; a run that records `workflows: false` for a merge that
+  changes gated paths relative to the head is refused even with an approval.
+  The check runs even when the base changed no gated path, because a merge
+  can follow a rename into `.github/`; a gated file both the branch and the
+  base changed is not merged at all -- the run leaves the merge out, the
+  brief says a person must merge it by hand, and publish pushes the patch
+  alone -- unless the branch already made the identical change (same blob
+  and mode as the base tip, a cherry-picked fix say), which is not an
+  overlap and merges with no approval. A merge that would land gated
+  content the base tip does not have at its path -- a rename the merge
+  follows into `.github/`, say -- is skipped at run time with a reason in
+  the brief, and the behind and diverged fallbacks push the patch alone
+  instead of failing every publish (issue #20). The run-side merge commit is data
   verified by recomputation, never fetched or trusted; with no
   `merge-info.json` present, publish falls back to merging
   the base tip first and applying the patch on top of it. It applies it with

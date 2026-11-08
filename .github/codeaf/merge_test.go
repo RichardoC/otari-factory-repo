@@ -416,6 +416,70 @@ func TestRunMergeSkipsWhenNoMergeNeeded(t *testing.T) {
 	}
 }
 
+// Issue #21: a merge that conflicts in more files than a merge info can
+// name would produce a merge-info.json the reader refuses, and publish
+// treats a merge info that exists but does not validate as fatal -- so
+// every rerun would fail the same way until a person merged the branch by
+// hand. runMerge degrades to no merge instead: state none, no merge info,
+// and a recorded reason naming the count and the hand merge; publish then
+// takes its no-info path and pushes the patch alone.
+func TestRunMergeDegradesWideConflictToNoMerge(t *testing.T) {
+	r := newTestRepo(t)
+	baseFiles := make(map[string]string, MaxMergeConflictPaths+1)
+	prFiles := make(map[string]string, MaxMergeConflictPaths+1)
+	mainFiles := make(map[string]string, MaxMergeConflictPaths+1)
+	for i := 0; i <= MaxMergeConflictPaths; i++ {
+		name := "f" + strconv.Itoa(i) + ".txt"
+		baseFiles[name] = "a\nb\nc\n"
+		prFiles[name] = "a\npr\nc\n"
+		mainFiles[name] = "a\nbase\nc\n"
+	}
+	base := r.commit("base", baseFiles)
+	pr := r.commit("pr change", prFiles, base)
+	mainTip := r.commit("main change", mainFiles, base)
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	origin := r.withOrigin("pr", "main")
+	baseFile, infoFile, stateFile := artifactDir(t)
+
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != "none" {
+		t.Fatalf("runMerge: state=%q err=%v; want none", got.State, err)
+	}
+	if r.head() != pr {
+		t.Fatal("the branch moved without a merge")
+	}
+	if _, err := os.Stat(infoFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("merge info written for a merge that was not made: %v", err)
+	}
+	runState, err := os.ReadFile(runStateFile(infoFile))
+	if err != nil {
+		t.Fatalf("no no-merge record: %v", err)
+	}
+	if !strings.Contains(string(runState), "state=none") ||
+		!strings.Contains(string(runState), "conflicts in 201 files") ||
+		!strings.Contains(string(runState), "by hand") {
+		t.Fatalf("no-merge reason = %q; want the count and the hand merge", runState)
+	}
+
+	// Publish, from a fresh checkout still at the pushed PR head: with no
+	// merge info it takes the no-info path, and the branch's own merge
+	// with the base would conflict, so the patch goes alone (state none,
+	// no error, the head untouched).
+	if err := os.WriteFile(baseFile, []byte(pr+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pub := publishCheckout(t, origin, "pr")
+	out, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r))
+	if err != nil || out.State != "none" {
+		t.Fatalf("publishMerge: state=%q err=%v; want the no-info path with state none", out.State, err)
+	}
+	if head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD")); head != pr {
+		t.Fatalf("publish head = %s, want %s", head, pr)
+	}
+}
+
 // ---------------------------------------------------------------- the brief
 
 func TestMergeBriefSectionNamesConflictedFiles(t *testing.T) {

@@ -318,11 +318,17 @@ func usableMergePath(path string) bool {
 	return true
 }
 
+// MaxMergeConflictPaths is the most conflicted paths a merge info may
+// name. The writer (runMerge) and the reader (sanitizeMergeFiles) share
+// it, so a merge that conflicts more widely degrades to no merge on the
+// run side instead of producing a merge-info.json the reader would
+// refuse on every rerun (issue #21).
+const MaxMergeConflictPaths = 200
+
 // sanitizeMergeFiles bounds the conflicted path list itself.
 func sanitizeMergeFiles(files []string) ([]string, error) {
-	const maxFiles = 200
-	if len(files) > maxFiles {
-		return nil, fmt.Errorf("merge info names %d conflicted paths, over the %d allowed", len(files), maxFiles)
+	if len(files) > MaxMergeConflictPaths {
+		return nil, fmt.Errorf("merge info names %d conflicted paths, over the %d allowed", len(files), MaxMergeConflictPaths)
 	}
 	out := make([]string, 0, len(files))
 	seen := make(map[string]bool, len(files))
@@ -589,6 +595,32 @@ func runMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile string, compar
 	if conflicted {
 		kind = mergeKindConflicted
 		message = fmt.Sprintf("Merge %s into %s (conflicts, to be resolved by CodeAF)", baseRef, branch)
+	}
+	// Issue #21: publish reads merge-info.json under bounds it refuses the
+	// file on -- at most MaxMergeConflictPaths conflicted paths, and at
+	// most 64 KB. A merge conflicting in more files than that (a wide
+	// refactor, import or line-ending sweep) would produce a merge info
+	// that can never validate, and publish treats a merge info that exists
+	// but does not validate as fatal, so every rerun would fail the same
+	// way until a person merges the branch by hand. Like everything else
+	// the run cannot establish, that degrades to no merge: the brief names
+	// the count, and publish pushes the patch alone.
+	if conflicted && len(files) > MaxMergeConflictPaths {
+		mergeNotMade(mergeInfoFile, "the merge of %s conflicts in %d files, over the %d a merge info can name; a person must merge the branch by hand", baseRef, len(files), MaxMergeConflictPaths)
+		log.Printf("merge-default: the merge of %s conflicts in %d files, over the %d allowed; continuing without a merge (a person must merge it by hand)", baseRef, len(files), MaxMergeConflictPaths)
+		return out, nil
+	}
+	if conflicted {
+		// The merge info the run would record must fit what the reader
+		// accepts. The commit id is a 40-hex sha of fixed length, so a
+		// placeholder of that length sizes the record exactly; the same
+		// MarshalIndent form is what gets written below.
+		probe := mergeInfo{Kind: kind, Commit: strings.Repeat("0", 40), Base: head, Onto: onto, Tree: tree, Files: files, Workflows: carryGated}
+		if data, err := json.MarshalIndent(probe, "", "  "); err == nil && len(data)+1 > 1<<16 {
+			mergeNotMade(mergeInfoFile, "the merge info for %d conflicted files would be over the 64 KB the reader accepts; a person must merge the branch by hand", len(files))
+			log.Printf("merge-default: the merge info for %s would be %d bytes, over the 64 KB allowed; continuing without a merge (a person must merge it by hand)", baseRef, len(data)+1)
+			return out, nil
+		}
 	}
 	commit, err := commitMerge(dir, tree, head, onto, message)
 	if err != nil {

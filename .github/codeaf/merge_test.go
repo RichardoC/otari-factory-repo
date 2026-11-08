@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // The tests build real git repositories with plumbing (hash-object, mktree,
@@ -621,6 +623,79 @@ func TestMergeBriefSectionNoMergeReason(t *testing.T) {
 		}
 	} else {
 		t.Fatal("no reason in the section:\n" + section)
+	}
+}
+
+// Issue #22: cutting a reason at 300 bytes must not split a multi-byte rune,
+// either in the record mergeNotMade writes or in the brief rendered from it.
+func TestMergeBriefSectionCapsReasonOnRuneBoundary(t *testing.T) {
+	dir := t.TempDir()
+	infoPath := filepath.Join(dir, "merge-info.json")
+	// 299 ASCII bytes then a two-byte rune: the cut at byte 300 falls inside
+	// the rune, so a plain reason[:300] would leave invalid UTF-8.
+	reason := strings.Repeat("a", 299) + strings.Repeat("\u00e9", 400)
+	mergeNotMade(infoPath, "%s", reason)
+
+	recorded, err := os.ReadFile(runStateFile(infoPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, recordedReason, ok := strings.Cut(string(recorded), "reason=")
+	if !ok {
+		t.Fatalf("no reason recorded: %q", recorded)
+	}
+	recordedReason = strings.TrimSuffix(recordedReason, "\n")
+	if !utf8.ValidString(recordedReason) {
+		t.Fatalf("recorded reason is not valid UTF-8: %q", recordedReason)
+	}
+	if len(recordedReason) > maxNoMergeReasonBytes {
+		t.Fatalf("recorded reason is not bounded: %d bytes", len(recordedReason))
+	}
+
+	section, err := mergeBriefSection(infoPath)
+	if err != nil {
+		t.Fatalf("mergeBriefSection: %v", err)
+	}
+	if !utf8.ValidString(section) {
+		t.Fatalf("brief section is not valid UTF-8: %q", section)
+	}
+	if !strings.Contains(section, "not merged") {
+		t.Fatalf("brief section lacks the no-merge paragraph: %q", section)
+	}
+}
+
+// Issue #22: mergeSkipped builds its message from baseRef, git error text and
+// gated paths, none of it trusted. A path holding a newline and a workflow
+// command must not break the log line or forge a second ::command:: line.
+func TestMergeSkippedSanitisesMessage(t *testing.T) {
+	t.Setenv("HARNESS_APPROVED", "true")
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	defer log.SetOutput(os.Stderr)
+
+	out, err := captureStdout(t, func() error {
+		mergeSkipped("the base branch %s changed gated .github/ paths (%v)", "main", []string{"evil\n::error::x"})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(out, "\n") != 1 {
+		t.Fatalf("stdout has a newline inside the warning message: %q", out)
+	}
+	warning := strings.TrimSuffix(out, "\n")
+	if strings.Count(warning, "\n") != 0 || !strings.HasPrefix(warning, "::warning::") {
+		t.Fatalf("stdout is not exactly one ::warning:: line: %q", out)
+	}
+	if strings.Contains(warning, "\n::") {
+		t.Fatalf("stdout has a forged workflow command line: %q", out)
+	}
+	loggedText := logged.String()
+	if strings.Count(loggedText, "\n") != 1 {
+		t.Fatalf("log has a newline inside the message: %q", loggedText)
+	}
+	if line := strings.TrimSuffix(loggedText, "\n"); strings.HasPrefix(line, "::") {
+		t.Fatalf("log line is a workflow command: %q", loggedText)
 	}
 }
 

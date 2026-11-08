@@ -1853,6 +1853,83 @@ func TestRunReviewBrief(t *testing.T) {
 		}
 	}
 
+	// Review follow-up on #38, the overflow branch: four app AGENTS.md
+	// sections (each capped at maxAppRulesBytes) in issueRules push the fixed
+	// sections past maxBriefBytes even with empty bodies, so the diff gives
+	// way. The brief stays within the cap, the output contract survives, the
+	// diff carries a truncation note, and both bodies keep a note naming
+	// them even though the room the fixed sections leave is far smaller than
+	// either body.
+	overPR := "Closes #3\n\n" + padTo("pr overflow line\n", 30000-len("Closes #3\n\n"))
+	overIssue := "Areas: app/ovfa/queue.go app/ovfb/queue.go app/ovfc/queue.go app/ovfd/queue.go\n\n" +
+		padTo("issue overflow line\n", 65000)
+	overRoutes := map[string]string{
+		"/repos/RichardoC/factory-repo/pulls/7":           `{"number":7,"title":"Review target","body":` + fmt.Sprintf("%q", overPR) + `,"state":"open","head":{"ref":"codeaf/issue-3-42"},"base":{"ref":"main"}}`,
+		"/repos/RichardoC/factory-repo/issues/3":          `{"number":3,"title":"The task","body":` + fmt.Sprintf("%q", overIssue) + `}`,
+		"/repos/RichardoC/factory-repo/issues/7/comments": `[]`,
+	}
+	for _, name := range []string{"ovfa", "ovfb", "ovfc", "ovfd"} {
+		// ~24 KB each, capped to maxAppRulesBytes in the section: four of
+		// them plus the ~59 KB diff overrun maxBriefBytes on their own.
+		withAppRules(overRoutes, name, strings.Repeat("rule line for "+name+"\n", 1200))
+	}
+	ghEnv(t, reviewServer(t, overRoutes, bigDiff, nil))
+	briefPath = filepath.Join(t.TempDir(), "overflow.md")
+	t.Setenv("NUMBER", "7")
+	t.Setenv("BRIEF_PATH", briefPath)
+	if _, err := captureStdout(t, runReviewBrief); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b = string(data)
+	if len(b) > maxBriefBytes {
+		t.Errorf("overflow brief is %d bytes, cap is %d", len(b), maxBriefBytes)
+	}
+	if !strings.Contains(b, "## Rules for app/ovfa") {
+		t.Errorf("the overflow brief lost the app rules that push the base over the cap")
+	}
+	if !strings.Contains(b, reviewOutputContract) {
+		t.Errorf("the output contract was cut from the overflow brief")
+	}
+	if !strings.Contains(b, "(diff truncated at ") {
+		t.Errorf("the overflow brief does not note the diff truncation")
+	}
+	for _, name := range []string{"(pull request body ", "(closing issue body "} {
+		if !strings.Contains(b, name) {
+			t.Errorf("the overflow brief does not name the dropped section %q", name)
+		}
+	}
+
+	// Review follow-up on #38: a PR with no linked issue gets more than half
+	// the room for its body — the whole 60000-byte body fits, which the old
+	// room/2 share (about 46 KB here) would have cut mid-body with no issue
+	// body to blame.
+	freePR := padTo("free pr body line\n", 60000)
+	freeRoutes := map[string]string{
+		"/repos/RichardoC/factory-repo/pulls/7":           `{"number":7,"title":"No issue","body":` + fmt.Sprintf("%q", freePR) + `,"state":"open","head":{"ref":"feat"},"base":{"ref":"main"}}`,
+		"/repos/RichardoC/factory-repo/issues/7/comments": `[]`,
+	}
+	ghEnv(t, reviewServer(t, freeRoutes, diffBody, nil))
+	briefPath = filepath.Join(t.TempDir(), "free-pr.md")
+	t.Setenv("BRIEF_PATH", briefPath)
+	if _, err := captureStdout(t, runReviewBrief); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b = string(data)
+	if len(b) > maxBriefBytes {
+		t.Errorf("brief is %d bytes, cap is %d", len(b), maxBriefBytes)
+	}
+	if tail := freePR[len(freePR)-200:]; !strings.Contains(b, tail) {
+		t.Errorf("the tail of a 60000-byte PR body was cut: with no linked issue the body must get more than half the room")
+	}
+
 	// Required inputs are refused loudly.
 	t.Setenv("BRIEF_PATH", "")
 	if _, err := captureStdout(t, runReviewBrief); err == nil {

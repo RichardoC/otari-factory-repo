@@ -1490,18 +1490,30 @@ func capDiffPrefix(diff string, max int) string {
 	return diff[:cut] + note
 }
 
-// cappedDiffForBrief caps the fetched diff for the brief (issue #458). A
-// fetch that stopped at diffReadCap ends in diffFetchNote, and capDiff
-// keeps a prefix of the whole text with a note of its own — so the fetch
-// note would always land past the cap and never reach the reviewer, who
-// would review an incomplete diff believing it complete. The note is
-// therefore reserved out of the budget and re-appended after the cut.
+// cappedDiffForBrief caps the fetched diff for the brief at its usual
+// maxReviewDiffBytes budget (issue #458). A fetch that stopped at
+// diffReadCap ends in diffFetchNote, and capDiff keeps a prefix of the whole
+// text with a note of its own — so the fetch note would always land past the
+// cap and never reach the reviewer, who would review an incomplete diff
+// believing it complete. The note is therefore reserved out of the budget
+// and re-appended after the cut.
 func cappedDiffForBrief(diff string, truncated bool) string {
+	return cappedDiffText(diff, maxReviewDiffBytes, truncated)
+}
+
+// cappedDiffText is cappedDiffForBrief with an explicit budget, so a
+// re-cap at a smaller budget (the overflow path of runReviewBrief) keeps the
+// fetch note too: a plain capDiff re-cap of the raw diff used to drop it,
+// and the reviewer would read a re-capped prefix as the whole fetched diff.
+func cappedDiffText(diff string, max int, truncated bool) string {
 	if !truncated {
-		return capDiff(diff, maxReviewDiffBytes)
+		return capDiff(diff, max)
 	}
 	note := diffFetchNote()
-	s := capDiff(diff, maxReviewDiffBytes-len(note)-1)
+	if max <= len(note) {
+		return note // no room for any diff text; the note alone says why
+	}
+	s := capDiff(diff, max-len(note)-1)
 	if s != "" && s[len(s)-1] != '\n' {
 		s += "\n" // capDiff's own note may end mid-line after the cut
 	}
@@ -1515,25 +1527,28 @@ const reviewHarnessPreChangeSentence = "the `harness` binary on `PATH` was built
 
 // capReviewBody caps one untrusted review-brief body on its own (issue #38)
 // so it cannot crowd the diff and the machine-parsed output contract out of
-// the whole brief. The note names the section and counts against max; when
-// max is smaller than the note there is no room to say so, and the body is
-// dropped rather than exceeding the budget.
+// the whole brief. The note names the section and counts against max. Even
+// when max leaves no room for any body text — a room of zero, or less than
+// the note itself — an omission note names the cut (review follow-up on
+// #38): a body used to vanish without a mark, taking the issue's "Done
+// when" with it. An empty body still returns empty, so a section that does
+// not exist adds no note and no separator.
 func capReviewBody(s, name string, max int) string {
-	if max < 0 {
-		max = 0
+	if s == "" {
+		return ""
 	}
 	if len(s) <= max {
 		return s
 	}
 	note := fmt.Sprintf("\n\n(%s truncated at %d bytes)\n", name, max)
-	if max < len(note) {
-		return ""
+	if max >= len(note) {
+		cut := max - len(note)
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		return s[:cut] + note
 	}
-	cut := max - len(note)
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut] + note
+	return fmt.Sprintf("\n\n(%s omitted: the brief is over its size limit)\n", name)
 }
 
 // runReviewBrief implements `harness review-brief` (issue #32): the review
@@ -1614,10 +1629,12 @@ func runReviewBrief() error {
 		return strings.Join(parts, "\n\n") + "\n"
 	}
 	base := build("", "")
-	// The fixed sections can overrun the cap on their own only if the standing
-	// instructions or the previous report grow without bound. The diff then
-	// gives way first, always with its own truncation note, so the output
-	// contract still reaches the reviewer.
+	// The fixed sections can overrun the cap on their own — issueAreas can
+	// pull several app AGENTS.md sections of up to maxAppRulesBytes each into
+	// issueRules, and the standing instructions or the previous report can
+	// grow. The diff then gives way first, always with its own truncation
+	// note (and the fetch note when the fetch itself was truncated), so the
+	// output contract still reaches the reviewer.
 	if len(base) > maxBriefBytes {
 		// overhead is the section's heading and code fence around diffText.
 		overhead := len(diffSection) - len(diffText)
@@ -1625,7 +1642,9 @@ func runReviewBrief() error {
 		if room < capDiffFloorBytes {
 			room = capDiffFloorBytes
 		}
-		diffText = capDiff(diff, room)
+		// cappedDiffText, not capDiff: a re-cap of the raw diff must keep the
+		// fetch note the first cap reserved (review follow-up on #38).
+		diffText = cappedDiffText(diff, room, truncated)
 		diffSection = "# The diff under review\n\n```diff\n" + diffText + "\n```"
 		base = build("", "")
 	}
@@ -1633,9 +1652,31 @@ func runReviewBrief() error {
 	if room < 0 {
 		room = 0
 	}
-	prBody := capReviewBody(pr.Body, "pull request body", room/2)
+	// The PR body's share is half the room plus whatever the issue body does
+	// not use, so a short or missing issue body leaves all of its half to the
+	// PR body (review follow-up on #38).
+	prBody := capReviewBody(pr.Body, "pull request body", max(room/2, room-len(issueBody)))
 	issueBody = capReviewBody(issueBody, "closing issue body", room-len(prBody))
 	brief := build(prBody, issueBody)
+	// A base that nearly fills the cap leaves less room than the two notes
+	// the bodies keep even then: the diff gives way for the notes rather than
+	// the notes (or the contract behind them) being cut anonymously.
+	for len(brief) > maxBriefBytes && len(diffText) > capDiffFloorBytes {
+		excess := len(brief) - maxBriefBytes
+		shrink := len(diffText) - capDiffFloorBytes
+		if excess+128 < shrink {
+			shrink = excess + 128 // one pass, with margin for note-size drift
+		}
+		diffText = cappedDiffText(diff, len(diffText)-shrink, truncated)
+		diffSection = "# The diff under review\n\n```diff\n" + diffText + "\n```"
+		brief = build(prBody, issueBody)
+	}
+	// Truncation keeps the head of each body, so the issue's "Done when" —
+	// the tail of untrusted text of unknown shape — can be cut whatever
+	// share the issue body gets: keeping it would mean parsing the body to
+	// find the section, which the brief does not do. The note that names the
+	// cut is the guarantee instead, and it survives every path above: the
+	// diff pays for it before the whole-brief cap is ever reached.
 	if len(brief) > maxBriefBytes {
 		// Unreachable while the fixed sections stay bounded; retained so a
 		// future unbounded section degrades to the old whole-brief note.

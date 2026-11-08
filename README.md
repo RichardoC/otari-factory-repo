@@ -443,45 +443,67 @@ only thing applied from `run`, the `.github/` approval check still applies
 to the staged patch diff only, and every new commit still descends from
 the PR head -- no force-push.
 
-One limit: if the base branch changed anything under `.github/workflows/`
-since the PR branched, bringing the base in takes a maintainer's approval.
-The run job still computes and commits the merge — clean or conflicted,
-exactly as for any other merge — and records that it carries workflow
-changes as `workflows: true` in `merge-info.json`. When that field is set,
-the workflow routes `publish` into the `codeaf-harness` environment, so a
-maintainer must approve. With approval, `publish` recreates the merge (still
-from the same two parents, still verified by tree hash) and pushes it with
-the GitHub App token, which can carry workflow changes where `GITHUB_TOKEN`
-cannot; it refuses unless every workflow path the merge changes relative to
-the PR head equals the recorded base tip's content and file mode --
-additions, edits and deletions alike -- so the merge brings in only what the
-base already has. Without approval, `publish` refuses with an error naming the
-maintainer approval rather than silently pushing the patch alone. When there
-is no `merge-info.json` (the behind and diverged fallbacks), the patch is
-still pushed alone without approval, and the base is merged in as above once
-approved.
+One limit: if the base branch changed anything under `.github/` outside
+`.github/codeaf/` since the PR branched (issue #20; before it,
+`.github/workflows/` only), bringing the base in takes a maintainer's
+approval. The run job still computes and commits the merge — clean or
+conflicted, exactly as for any other merge — and records that it carries
+gated changes as `workflows: true` in `merge-info.json`. When that field is
+set, the workflow routes `publish` into the `codeaf-harness` environment, so
+a maintainer must approve. With approval, `publish` recreates the merge
+(still from the same two parents, still verified by tree hash) and pushes it
+with the GitHub App token, which can carry workflow changes where
+`GITHUB_TOKEN` cannot; it refuses unless every gated path the merge changes
+relative to the PR head equals the recorded base tip's content and file mode
+-- additions, edits and deletions alike -- so the merge brings in only what
+the base already has. Without approval, `publish` refuses with an error
+naming the maintainer approval rather than silently pushing the patch alone.
+When there is no `merge-info.json` (the behind and diverged fallbacks), the
+patch is still pushed alone without approval, and the base is merged in as
+above once approved.
+
+Why every `.github/` path outside `.github/codeaf/` and not just the
+workflows (the owner's decision, issue #20): a PR's *own* `.github/` edits
+were already gated at the patch level, but a base merge carried the base
+branch's copies of `CODEOWNERS`, `.github/actions/`, `dependabot.yml` and
+the rest unchecked. That was low-risk while the base was the default branch
+a human curates, and a gap once a PR could target a non-default base
+branch -- the merge would land that branch's `.github/` content with no
+check at all -- so the merge side now applies the same per-path rule as the
+patch side. `.github/codeaf/` stays outside the merge gate, like the
+patch-level one: the harness is built only from the default branch, so its
+copy on a PR branch is inert, it publishes like app code, and a person
+reviews every PR before it merges.
 
 The `workflows` field is untrusted input from the `run` job, so `publish`
-never trusts it: it recomputes whether the recreated merge changes a workflow
-path relative to the PR head, requires the approval whenever that
+never trusts it: it recomputes whether the recreated merge changes a gated
+`.github/` path relative to the PR head, requires the approval whenever that
 recomputation says so -- an error counting as changed -- or the field is set,
 and refuses, even with an approval, a run that recorded `workflows: false`
-for a merge that changes workflow paths relative to the head. The field,
+for a merge that changes gated paths relative to the head. The field,
 like `touches_harness`, only routes the job. The byte check runs whatever the
 flags say, and it compares the merge with the base tip the run actually
 merged in, not the base branch's current tip.
 
-"Carries" is measured relative to the PR head: the branch's own workflow
-edits are kept, because a merge that leaves a workflow path as it is on the
+"Carries" is measured relative to the PR head: the branch's own gated
+edits are kept, because a merge that leaves a gated path as it is on the
 head publishes nothing new, so that path is neither checked nor gated on the
-approval. Only workflow paths the merge actually changes must equal the
+approval. Only gated paths the merge actually changes must equal the
 merged-in base tip's content and mode, and bringing those in needs the
 approval. The check is not fooled by renames either: it runs even when the
-base changed no workflow path, because a merge can follow a rename into
-`.github/workflows/`. A workflow file that the branch and its base both
-changed is not merged at all -- the merged content would equal neither
-side's, so the run skips the merge and the brief says a person must merge
-the branch by hand, and `publish` pushes the patch alone.
+base changed no gated path, because a merge can follow a rename into
+`.github/`. A gated file that the branch and its base both changed is not
+merged at all -- the merged content would equal neither side's, so the run
+skips the merge and the brief says a person must merge the branch by hand,
+and `publish` pushes the patch alone -- unless the branch already made the
+identical change (the same blob and mode the base tip has, a cherry-picked
+fix, say): that is not an overlap, the merge carries nothing relative to the
+head, and it publishes with no approval (issue #20). Nor is a merge made
+that would land gated content the base tip does not have at its path -- a
+rename the merge follows into `.github/`, say (issue #20): `publish` would
+refuse it even approved, on every run, so the run skips the merge itself
+with a reason in the brief, and the behind and diverged fallbacks push the
+patch alone instead of failing the publish.
 
 ### Keeping CodeAF current (issue #35)
 

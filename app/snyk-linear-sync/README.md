@@ -462,6 +462,11 @@ The cache lives in SQLite and stores:
 - a schema signature for the managed issue format
 - a normalized hash for each Snyk finding
 - a normalized hash for each managed Linear issue
+- the timestamp of the last successful cache write, so a run reports how stale
+  the hashes it fast-paths against are
+- cached v1 ignore metadata; an entry not confirmed by the Snyk API for seven
+  days, or one whose stored timestamp cannot be parsed, is dropped on read and
+  counted in the refreshed-cache log line
 
 On a normal run:
 

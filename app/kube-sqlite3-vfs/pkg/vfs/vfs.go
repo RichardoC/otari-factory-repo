@@ -1823,7 +1823,9 @@ func (v *vfs) Access(name string, flags sqlite3vfs.AccessFlag) (bool, error) {
 // would otherwise reach the VFS verbatim and map to a different ConfigMap
 // set than the cleaned spelling, splitting one database in two on the
 // cluster. The rule implemented here: clean the name and normalise
-// separators, while absolute names pass through unchanged (SQLite appends
+// separators. Absolute names are cleaned too — /data/sub/../app.db becomes
+// /data/app.db — but stay absolute, and a leading slash is never folded
+// away (/app.db and app.db remain different databases) (SQLite appends
 // -journal itself after canonicalisation, so cleaning the base name
 // suffices).
 func (v *vfs) FullPathname(name string) string {

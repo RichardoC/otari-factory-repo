@@ -205,6 +205,20 @@ The VFS is no longer "really very slow" at the Kubernetes API, though: reads and
 * **`NewVFS` takes variadic options.** The signature is now `NewVFS(ctx, kc, namespace, logger, retries, opts ...Option)`. Existing calls compile unchanged (the variadic parameter may be omitted); to pass options, append them: `NewVFS(ctx, kc, ns, logger, retries, vfs.WithLockLease(10*time.Second))`. The only option today is `WithLockLease`.
 * **`WithLockLease(0)` (or any non-positive value) keeps the default 30 s lease.** `Option` cannot return an error, so an out-of-range value is documented behaviour — the default stands — rather than a silently broken lease. Pass a positive duration to shorten or lengthen the lease.
 
+### FullPathname canonicalises file names (this PR)
+
+SQLite reaches `xFullPathname` on every open, and before this change the VFS returned the name exactly as the caller spelt it. A database created under a name that was not clean — for example `./x.db` or `a/../x.db` — was therefore stored on the cluster under that literal name (`base32("./x.db")…`), while the same database opened as `x.db` now resolves to the cleaned name and looks for `base32("x.db")…`. **The ConfigMaps of a database first created under an unclean spelling are no longer found**, and opening the database anew creates a second, empty one under the clean name.
+
+To migrate such a database:
+
+* open it by its old literal name with an earlier version of this VFS and copy the data out (for example `ATTACH` both databases and `INSERT INTO clean.db SELECT * FROM old-literal.db`, or `sqlite3`'s `.backup`), then open it under the clean name going forward; or
+* rename the ConfigMaps in place: names, the `relevant-file` label and the `filename` data key are all pure functions of the file name, so every ConfigMap whose name, label or `filename` key encodes the old literal name can be renamed (or edited) to the base32 encoding of the cleaned name — the lockfile suffix `-lockfile` and the `-<index>` sector suffixes stay as they are.
+
+Two boundaries of the canonicalisation worth knowing:
+
+* absolute paths are cleaned but stay absolute: `/data/sub/../app.db` resolves to `/data/app.db`;
+* a leading slash is never folded away: **`/app.db` and `app.db` remain two different databases**, as before.
+
 ## TODO
 
 * ~~have filesize be O(1) rather than O(n)~~ — done: `FileSize` is O(1) while a SHARED-or-better lock is held, and otherwise costs one LIST that revalidates and warms the sector cache.

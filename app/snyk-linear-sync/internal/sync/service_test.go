@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -115,8 +116,13 @@ type fakeLinear struct {
 }
 
 type fakeCache struct {
-	snapshot cache.Snapshot
-	saved    cache.Snapshot
+	snapshot  cache.Snapshot
+	saved     cache.Snapshot
+	evictions cache.IgnoreEvictionCounts
+}
+
+func (f *fakeCache) IgnoreEvictions() cache.IgnoreEvictionCounts {
+	return f.evictions
 }
 
 func (f *fakeLinear) LoadSnapshot(context.Context) ([]model.ExistingIssue, error) {
@@ -8057,5 +8063,49 @@ func TestIssueTitleCapsUnboundedFields(t *testing.T) {
 	}
 	if issueTitle(finding) != title {
 		t.Fatalf("issueTitle is not deterministic for the same finding")
+	}
+}
+
+// TestRunLogsCacheAgeAndIgnoreEvictions pins the cache observability the run
+// reports: the age of the hash snapshot it loaded, and how many cached v1
+// ignore rows were discarded as stale or unparseable.
+func TestRunLogsCacheAgeAndIgnoreEvictions(t *testing.T) {
+	cfg := config.Config{
+		Linear: config.LinearConfig{
+			Due: config.DueDateConfig{
+				CriticalDays: 15,
+				HighDays:     30,
+				MediumDays:   45,
+				LowDays:      90,
+			},
+		},
+		Sync: config.SyncConfig{Workers: 1},
+	}
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+
+	snyk := fakeSnyk{snapshot: model.SnykSnapshot{}}
+	linear := &fakeLinear{}
+	cacheStore := &fakeCache{
+		snapshot: cache.Snapshot{
+			SchemaSignature: managedSchemaSignature(),
+			SavedAt:         time.Now().UTC().Add(-2 * time.Hour),
+		},
+		evictions: cache.IgnoreEvictionCounts{
+			TTLExpired:  3,
+			Unparseable: 1,
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, cacheStore)
+	if _, err := service.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	out := logs.String()
+	for _, want := range []string{"cache_age=", "ignore_evicted_ttl=3", "ignore_evicted_unparseable=1"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("logs missing %q:\n%s", want, out)
+		}
 	}
 }

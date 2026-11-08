@@ -237,3 +237,101 @@ func TestSnykIgnoresTTLEvictsUnparseableUpdatedAt(t *testing.T) {
 		t.Fatalf("UpdatedAt = %v, want the zero time for an absent value", absent.UpdatedAt)
 	}
 }
+
+// TestSaveAndLoadRoundTripsSavedAt pins that a snapshot's saved_at survives a
+// Save/Load round trip, so a later run can report how stale the hashes it
+// fast-paths against are.
+func TestSaveAndLoadRoundTripsSavedAt(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(filepath.Join(dir, "test-cache.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	before := time.Now().UTC().Add(-time.Second)
+	if err := store.Save(ctx, Snapshot{
+		SchemaSignature: "test-sig-v1",
+		SnykHashes:      map[string]string{},
+		LinearHashes:    map[string]string{},
+	}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	after := time.Now().UTC().Add(time.Second)
+
+	loaded, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if loaded.SavedAt.IsZero() {
+		t.Fatal("SavedAt = zero time, want the save timestamp")
+	}
+	if loaded.SavedAt.Before(before) || loaded.SavedAt.After(after) {
+		t.Fatalf("SavedAt = %v, want between %v and %v", loaded.SavedAt, before, after)
+	}
+}
+
+// TestLoadIgnoresReportsEvictionCounts pins that LoadIgnores reports the rows
+// it drops: a stale updated_at (TTL eviction) and an unparseable one are
+// counted separately, while a fresh row survives and is not counted.
+func TestLoadIgnoresReportsEvictionCounts(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(filepath.Join(dir, "test-cache.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := store.SaveIgnores(ctx, "project-a", map[string]IgnoreMeta{
+		"SNYK-FRESH":   {IssueKey: "SNYK-FRESH", UpdatedAt: now},
+		"SNYK-STALE":   {IssueKey: "SNYK-STALE", UpdatedAt: now.Add(-ignoreEntryTTL - time.Hour)},
+		"SNYK-CORRUPT": {IssueKey: "SNYK-CORRUPT", UpdatedAt: now},
+	}); err != nil {
+		t.Fatalf("SaveIgnores() error = %v", err)
+	}
+	if _, err := store.db.Exec(
+		`UPDATE snyk_ignores SET updated_at = 'not-a-timestamp' WHERE issue_key = 'SNYK-CORRUPT'`); err != nil {
+		t.Fatalf("corrupt updated_at: %v", err)
+	}
+
+	loaded, err := store.LoadIgnores(ctx, "project-a")
+	if err != nil {
+		t.Fatalf("LoadIgnores() error = %v", err)
+	}
+	if _, ok := loaded["SNYK-FRESH"]; !ok {
+		t.Fatal("fresh ignore entry was evicted")
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("loaded = %v, want only the fresh entry", loaded)
+	}
+
+	counts := store.IgnoreEvictions()
+	if counts.TTLExpired != 1 {
+		t.Fatalf("TTLExpired = %d, want 1", counts.TTLExpired)
+	}
+	if counts.Unparseable != 1 {
+		t.Fatalf("Unparseable = %d, want 1", counts.Unparseable)
+	}
+
+	// Counts accumulate across projects and loads: a run loads every
+	// project's ignores once, and the refreshed-cache line reports the run's
+	// total rather than the last project's.
+	if err := store.SaveIgnores(ctx, "project-b", map[string]IgnoreMeta{
+		"SNYK-STALE-B": {IssueKey: "SNYK-STALE-B", UpdatedAt: now.Add(-ignoreEntryTTL - time.Hour)},
+	}); err != nil {
+		t.Fatalf("SaveIgnores() project-b error = %v", err)
+	}
+	if _, err := store.LoadIgnores(ctx, "project-b"); err != nil {
+		t.Fatalf("LoadIgnores() project-b error = %v", err)
+	}
+	counts = store.IgnoreEvictions()
+	if counts.TTLExpired != 2 {
+		t.Fatalf("TTLExpired after second load = %d, want 2", counts.TTLExpired)
+	}
+	if counts.Unparseable != 1 {
+		t.Fatalf("Unparseable after second load = %d, want 1", counts.Unparseable)
+	}
+}

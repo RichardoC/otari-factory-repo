@@ -1249,6 +1249,62 @@ func TestReviewPlanWithholdsPassLabelWhenWorkerRunNotDone(t *testing.T) {
 	}
 }
 
+// TestReviewPlanWithdrawsPassLabelOnEveryNonPassingOutcome pins the plan half
+// of the label contract of issue #5: `label` is the only action that may
+// leave codeaf-review-passed on the pull request, so every report-only path
+// — no result at all, an early stop, an unrecognized severity, a draft, and
+// blocking findings with the fix budget spent — must return anything but
+// `label`. The workflow halves of the contract (the withdrawal calls) are
+// pinned in TestWorkflowWithdrawsReviewPassedLabel.
+func TestReviewPlanWithdrawsPassLabelOnEveryNonPassingOutcome(t *testing.T) {
+	hostile := reviewHostileFindings()
+	mixed := []Finding{{Severity: "critical", Path: "app/z/z.go", Line: 1, Text: "scale unknown", Recognized: false}}
+	done := Result{Stop: stopDone, Model: "deepseek-ai/deepseek-v4.1-flash"}
+	plan := func(t *testing.T, result Result, have bool, findings []Finding, sawSection bool) string {
+		t.Helper()
+		action, _, _, err := reviewPlan(newGitHub(), 7, result, have, findings, sawSection)
+		if err != nil {
+			t.Fatalf("reviewPlan: %v", err)
+		}
+		return action
+	}
+	nonPassing := []struct {
+		name   string
+		server func(t *testing.T)
+		result Result
+		have   bool
+		find   []Finding
+		saw    bool
+	}{
+		{"no result", func(t *testing.T) { ghEnv(t, commentsServer(t, reportComments(1), http.StatusOK)) }, Result{}, false, nil, false},
+		{"early stop", func(t *testing.T) { ghEnv(t, commentsServer(t, reportComments(1), http.StatusOK)) }, Result{Stop: stopDeadline}, true, nil, false},
+		{"unrecognized severity", func(t *testing.T) { ghEnv(t, commentsServer(t, reportComments(1), http.StatusOK)) }, done, true, mixed, true},
+		{"draft", func(t *testing.T) {
+			ghEnv(t, reviewServer(t, map[string]string{
+				"/repos/RichardoC/factory-repo/pulls/7": `{"number":7,"title":"t","state":"open","draft":true}`,
+			}, "", nil))
+		}, done, true, nil, false},
+		{"cap with blocking findings", func(t *testing.T) { ghEnv(t, commentsServer(t, reportComments(3), http.StatusOK)) }, done, true, hostile, true},
+	}
+	for _, tc := range nonPassing {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			tc.server(t)
+			if action := plan(t, tc.result, tc.have, tc.find, tc.saw); action == "label" {
+				t.Errorf("%s: action = %q; the pass label must be withdrawn, so every outcome but label must not be it", tc.name, action)
+			}
+		})
+	}
+	// The control: a clean pass over a ready pull request is still the one
+	// `label` outcome, so the table above discriminates rather than bans.
+	t.Run("clean pass labels", func(t *testing.T) {
+		ghEnv(t, commentsServer(t, reportComments(1), http.StatusOK))
+		if action := plan(t, done, true, nil, false); action != "label" {
+			t.Errorf("clean pass: action = %q, want label", action)
+		}
+	})
+}
+
 // TestReviewTableUnlocated renders the findings table for an unlocated
 // finding — the inline form (issue #49) whose path and line are empty — and
 // pins the whole table, because that cell used to render as `:0` (issue

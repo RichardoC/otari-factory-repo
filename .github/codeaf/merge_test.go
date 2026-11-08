@@ -3285,3 +3285,52 @@ func TestMergeBriefSectionBacktickNameStaysInCodeSpan(t *testing.T) {
 		}
 	}
 }
+
+// TestGitOutputStripsControlFromErrors covers issue #42: a git failure whose
+// argument carries a raw CR (and whose stderr carries it back) must not put a
+// control byte in the error text, where it could forge a workflow command in
+// the Actions log. The exit status stays reachable through the wrap so
+// callers can still tell a conflicting merge-tree (exit 1) apart.
+func TestGitOutputStripsControlFromErrors(t *testing.T) {
+	repo := newTestRepo(t)
+	const badRef = "no-such-ref\r::error::forged\nline"
+	cases := []struct {
+		name string
+		run  func() error
+	}{
+		{"gitOutput", func() error {
+			_, err := gitOutput(repo.dir, "rev-parse", badRef)
+			return err
+		}},
+		{"gitOutputAs", func() error {
+			_, err := gitOutputAs(repo.dir, "rev-parse", badRef)
+			return err
+		}},
+		{"gitEnvOutput", func() error {
+			_, err := gitEnvOutput(repo.dir, nil, "rev-parse", badRef)
+			return err
+		}},
+		{"blobEntry", func() error {
+			_, err := blobEntry(repo.dir, badRef, "README.md")
+			return err
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.run()
+			if err == nil {
+				t.Fatal("git call with an invalid ref unexpectedly succeeded")
+			}
+			msg := err.Error()
+			for i := 0; i < len(msg); i++ {
+				if b := msg[i]; b < 0x20 || b == 0x7f {
+					t.Fatalf("error byte %d is control %#x; error is %q", i, b, msg)
+				}
+			}
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) {
+				t.Fatalf("error lost git's exit status: %v", err)
+			}
+		})
+	}
+}

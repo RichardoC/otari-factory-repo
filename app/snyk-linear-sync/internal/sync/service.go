@@ -61,6 +61,9 @@ type LinearClient interface {
 type CacheStore interface {
 	Load(ctx context.Context) (cache.Snapshot, error)
 	Save(ctx context.Context, snapshot cache.Snapshot) error
+	// IgnoreEvictions reports how many cached v1 ignore rows LoadIgnores
+	// discarded as stale or unparseable, so the run can log them.
+	IgnoreEvictions() cache.IgnoreEvictionCounts
 }
 
 type Service struct {
@@ -208,6 +211,15 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			)
 		} else {
 			cacheSnapshot = loaded
+			cacheAge := "unknown"
+			if !loaded.SavedAt.IsZero() {
+				cacheAge = time.Since(loaded.SavedAt).Round(time.Second).String()
+			}
+			s.logger.Info("loaded sync cache",
+				slog.String("cache_age", cacheAge),
+				slog.Int("snyk_rows", len(loaded.SnykHashes)),
+				slog.Int("linear_rows", len(loaded.LinearHashes)),
+			)
 		}
 	}
 
@@ -855,11 +867,14 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		if err := s.cache.Save(runCtx, nextSnapshot); err != nil {
 			return result, err
 		}
+		ignoreEvictions := s.cache.IgnoreEvictions()
 		s.logger.Info("refreshed sync cache",
 			slog.Int("snyk_rows", len(nextSnapshot.SnykHashes)),
 			slog.Int("linear_rows", len(nextSnapshot.LinearHashes)),
 			slog.Int("uncached_failed", uncachedFailedCount),
 			slog.Int64("failed_ops", result.FailedOps),
+			slog.Int("ignore_evicted_ttl", ignoreEvictions.TTLExpired),
+			slog.Int("ignore_evicted_unparseable", ignoreEvictions.Unparseable),
 		)
 	}
 

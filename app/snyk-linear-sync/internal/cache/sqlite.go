@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	sq "github.com/Masterminds/squirrel"
@@ -32,13 +33,29 @@ type IgnoreMeta struct {
 
 type Snapshot struct {
 	SchemaSignature string
-	SnykHashes      map[string]string
-	LinearHashes    map[string]string
+	// SavedAt is when the snapshot was written by Save. It is zero for a
+	// cache written before saved_at was recorded, so callers must treat a
+	// zero value as "age unknown" rather than as very old.
+	SavedAt      time.Time
+	SnykHashes   map[string]string
+	LinearHashes map[string]string
+}
+
+// IgnoreEvictionCounts is the number of cached v1 ignore rows a Store's
+// LoadIgnores calls discarded. TTLExpired rows were seen in the Snyk API but
+// have not been confirmed for longer than ignoreEntryTTL; Unparseable rows
+// carry an updated_at in no recognised format and so cannot be aged.
+type IgnoreEvictionCounts struct {
+	TTLExpired  int
+	Unparseable int
 }
 
 type Store struct {
 	db      *sql.DB
 	builder sq.StatementBuilderType
+
+	evictionMu      sync.Mutex
+	ignoreEvictions IgnoreEvictionCounts
 }
 
 func Open(path string) (*Store, error) {
@@ -97,6 +114,35 @@ func (s *Store) Load(ctx context.Context) (Snapshot, error) {
 	}
 	if err := rows.Err(); err != nil {
 		return Snapshot{}, fmt.Errorf("iterate cache schema signature rows: %w", err)
+	}
+
+	query, args, err = s.builder.
+		Select("value").
+		From("sync_meta").
+		Where(sq.Eq{"key": "saved_at"}).
+		ToSql()
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("build cache saved_at query: %w", err)
+	}
+
+	savedAtRows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("load cache saved_at: %w", err)
+	}
+	defer savedAtRows.Close()
+	for savedAtRows.Next() {
+		var raw string
+		if err := savedAtRows.Scan(&raw); err != nil {
+			return Snapshot{}, fmt.Errorf("scan cache saved_at: %w", err)
+		}
+		// A malformed saved_at only means the age is unknown; it must not
+		// stop the cache from being used.
+		if savedAt, ok := parseTimestamp(raw); ok {
+			snapshot.SavedAt = savedAt
+		}
+	}
+	if err := savedAtRows.Err(); err != nil {
+		return Snapshot{}, fmt.Errorf("iterate cache saved_at rows: %w", err)
 	}
 
 	query, args, err = s.builder.
@@ -174,6 +220,20 @@ func (s *Store) Save(ctx context.Context, snapshot Snapshot) error {
 	}
 	if _, err = tx.ExecContext(ctx, query, args...); err != nil {
 		return fmt.Errorf("save cache schema signature: %w", err)
+	}
+
+	savedAt := time.Now().UTC()
+	query, args, err = s.builder.
+		Insert("sync_meta").
+		Columns("key", "value").
+		Values("saved_at", savedAt.Format(time.RFC3339)).
+		Suffix("ON CONFLICT(key) DO UPDATE SET value = excluded.value").
+		ToSql()
+	if err != nil {
+		return fmt.Errorf("build cache saved_at upsert: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, query, args...); err != nil {
+		return fmt.Errorf("save cache saved_at: %w", err)
 	}
 
 	query, args, err = s.builder.Delete("snyk_findings").ToSql()
@@ -383,9 +443,15 @@ func (s *Store) LoadIgnores(ctx context.Context, projectID string) (map[string]I
 			meta.CreatedAt = createdAt
 		}
 		updatedAt, updatedAtOK := parseTimestamp(updatedAtRaw)
-		if !updatedAtOK || (!updatedAt.IsZero() && updatedAt.Before(cutoff)) {
+		if !updatedAtOK {
 			// A corrupt updated_at cannot be aged, so evict the row instead
-			// of keeping it silently forever.
+			// of keeping it silently forever. Count it separately from TTL
+			// eviction so an operator can tell corruption from benign aging.
+			s.countIgnoreEviction(false)
+			continue
+		}
+		if !updatedAt.IsZero() && updatedAt.Before(cutoff) {
+			s.countIgnoreEviction(true)
 			continue
 		}
 		meta.UpdatedAt = updatedAt
@@ -397,6 +463,26 @@ func (s *Store) LoadIgnores(ctx context.Context, projectID string) (map[string]I
 	}
 
 	return out, nil
+}
+
+// countIgnoreEviction records one row discarded by LoadIgnores.
+func (s *Store) countIgnoreEviction(ttlExpired bool) {
+	s.evictionMu.Lock()
+	defer s.evictionMu.Unlock()
+	if ttlExpired {
+		s.ignoreEvictions.TTLExpired++
+		return
+	}
+	s.ignoreEvictions.Unparseable++
+}
+
+// IgnoreEvictions returns the cumulative counts of cached v1 ignore rows
+// discarded by LoadIgnores over this store's lifetime. A sync run loads each
+// project's ignores once, so these are the eviction counts for the run.
+func (s *Store) IgnoreEvictions() IgnoreEvictionCounts {
+	s.evictionMu.Lock()
+	defer s.evictionMu.Unlock()
+	return s.ignoreEvictions
 }
 
 // SaveIgnores stores v1 ignore metadata for a project, replacing any existing rows.

@@ -309,7 +309,7 @@ func usableMergePath(path string) bool {
 		return false
 	}
 	// Not one control byte of any kind (issue #34 security review): unquoting
-	// can bare a raw CR or TAB in a conflicted path, and a lone CR breaks a
+	// can leave a raw CR or TAB in a conflicted path, and a lone CR breaks a
 	// log line -- the runner treats it as a line break, so the rest of the
 	// name would run as a workflow command. \n and \x00 are covered too; the
 	// #22 rule is that no raw control character reaches a log line.
@@ -597,7 +597,7 @@ func runMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile string, compar
 		log.Printf("merge-default: could not tell whether the branch and %s edited the same gated .github/ files (%v); the overlap check is skipped", baseRef, err)
 	} else if len(overlap) > 0 {
 		mergeNotMade(mergeInfoFile, "the base branch changed .github/ file(s) %s that this branch also edits; the merged content would equal neither side's, so a person must merge it by hand", strings.Join(overlap, ", "))
-		log.Printf("merge-default: %s changed .github/ file(s) %s that %s also edits; continuing without a merge (a person must merge it by hand)", baseRef, strings.Join(overlap, ", "), branch)
+		log.Printf("merge-default: %s changed .github/ file(s) %s that %s also edits; continuing without a merge (a person must merge it by hand)", baseRef, quotedPaths(overlap), branch)
 		return out, nil
 	}
 	// Issue #16: the base having changed .github/workflows/ no longer skips
@@ -765,6 +765,27 @@ func printConflictNotice(baseRef, onto, branch string, files []string) {
 		list = capUTF8(list, 400) + "…"
 	}
 	fmt.Printf("::notice::merged %s (%s) into %s with conflicts; CodeAF must resolve: %s\n", baseRef, shortSHA(onto), branch, list)
+}
+
+// quotedPaths renders git-derived paths for one log line: every path is
+// quoted with %q, which escapes a raw CR or newline (issues #33 and #34), so
+// one name cannot split the line and forge a workflow command from the rest
+// of it.
+func quotedPaths(paths []string) string {
+	parts := make([]string, len(paths))
+	for i, p := range paths {
+		parts[i] = fmt.Sprintf("%q", p)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// printConflictMarkerError prints the publish jobs ::error:: line about one
+// unresolved conflict. This is the backstop of the path checks (issues #34
+// and #35): even if a check above ever let a control character through, the
+// line is printed stripped of them -- the runner treats a lone CR as a line
+// break, so the rest of the name would run as a workflow command.
+func printConflictMarkerError(where string) {
+	fmt.Printf("::error::conflict marker left in %s\n", stripControl(where))
 }
 
 // publishMerge is the publish half of issues #57 and #171. With the run's
@@ -1065,14 +1086,14 @@ func checkMergeGated(dir, head, commit, onto string) error {
 	for _, path := range changed {
 		inMerge, err := blobEntry(dir, commit, path)
 		if err != nil {
-			return fmt.Errorf("could not read %s in the merge commit %s: %w", path, shortSHA(commit), err)
+			return fmt.Errorf("could not read %q in the merge commit %s: %w", path, shortSHA(commit), err)
 		}
 		inOnto, err := blobEntry(dir, onto, path)
 		if err != nil {
-			return fmt.Errorf("could not read %s in the commit merged in (%s): %w", path, shortSHA(onto), err)
+			return fmt.Errorf("could not read %q in the commit merged in (%s): %w", path, shortSHA(onto), err)
 		}
 		if inMerge != inOnto {
-			return fmt.Errorf("the merge changes the .github/ file %s, but it is not what the commit it merged in (%s) already has (content or mode differ); a base merge brings in only what the base branch already has, so refusing the merge", path, shortSHA(onto))
+			return fmt.Errorf("the merge changes the .github/ file %q, but it is not what the commit it merged in (%s) already has (content or mode differ); a base merge brings in only what the base branch already has, so refusing the merge", path, shortSHA(onto))
 		}
 	}
 	return nil
@@ -1097,11 +1118,11 @@ func blobEntry(dir, rev, path string) (string, error) {
 	// which a path with spaces cannot move.
 	meta, _, ok := strings.Cut(line, "\t")
 	if !ok {
-		return "", fmt.Errorf("could not parse git ls-tree output for %s in %s", path, shortSHA(rev))
+		return "", fmt.Errorf("could not parse git ls-tree output for %q in %s", path, shortSHA(rev))
 	}
 	fields := strings.Fields(meta)
 	if len(fields) != 3 {
-		return "", fmt.Errorf("could not parse git ls-tree output for %s in %s", path, shortSHA(rev))
+		return "", fmt.Errorf("could not parse git ls-tree output for %q in %s", path, shortSHA(rev))
 	}
 	return fields[0] + " " + fields[2], nil
 }
@@ -1223,6 +1244,31 @@ func recreateMerge(dir, branch, baseRef string, info *mergeInfo, baseCommit, hea
 	}
 	if tree != info.Tree {
 		return out, fmt.Errorf("the recomputed merge tree %s does not match the tree the run recorded (%s); refusing the merge", shortSHA(tree), shortSHA(info.Tree))
+	}
+	// Issue #35 security review: the recomputed conflict names are untrusted
+	// too -- the agent can rewrite merge-info.json after the run, recording
+	// Files that pass sanitising while the recorded tree is the true one of a
+	// merge conflicting in a path usableMergePath refuses (one holding a raw
+	// newline, say). That raw list went into <state>.files, where the newline
+	// split it into paths that do not exist, verifyMerge read both as
+	// "resolved by deleting", and the markers in the real conflicted file
+	// were published. Sanitise the recomputed list exactly like the recorded
+	// one, and refuse when the two disagree: a merge info whose Files do not
+	// name the conflicts of its own tree is not this merges info.
+	if conflicted {
+		clean, err := sanitizeMergeFiles(files)
+		if err != nil {
+			return out, fmt.Errorf("the recomputed merge conflicts in a path the merge info cannot name: %w", err)
+		}
+		if len(clean) != len(info.Files) {
+			return out, fmt.Errorf("the recomputed merge conflicts in %d file(s), not the %d the run recorded; refusing the merge", len(clean), len(info.Files))
+		}
+		for i := range clean {
+			if clean[i] != info.Files[i] {
+				return out, errors.New("the recomputed merge conflicts in files the run did not record; refusing the merge")
+			}
+		}
+		files = clean
 	}
 	commit, err := commitMerge(dir, tree, head, info.Onto, fmt.Sprintf("Merge %s into %s", baseRef, branch))
 	if err != nil {
@@ -1358,8 +1404,11 @@ func verifyMerge(dir, stateFile string) error {
 		for _, m := range marked {
 			// Backstop (issue #34 security review): no raw path reaches a
 			// ::error:: line even if the path check above ever changes --
-			// a raw CR would forge a workflow command.
-			fmt.Printf("::error::conflict marker left in %s\n", stripControl(m))
+			// a raw CR would forge a workflow command. The print is a
+			// helper so it is tested directly (issue #35): usableMergePath
+			// refuses a control-bearing path before the backstop runs, so
+			// the whole verifyMerge path never reaches it.
+			printConflictMarkerError(m)
 		}
 		return fmt.Errorf("%d conflicted file(s) still carry conflict markers; every conflict must be resolved before publishing", len(marked))
 	}
@@ -1672,14 +1721,11 @@ func mergeBriefSection(path string) (string, error) {
 		for _, f := range info.Files {
 			// A backtick in a name would end the inline code span early and
 			// let the rest of the name render as brief text (issue #34
-			// security review). A backslash escape does not work inside a
-			// code span, so such a name is listed without one instead, the
-			// backticks escaped; the merge info itself keeps the real name.
-			if strings.Contains(f, "`") {
-				fmt.Fprintf(&b, "- %s\n", strings.ReplaceAll(f, "`", "\\`"))
-			} else {
-				fmt.Fprintf(&b, "- `%s`\n", f)
-			}
+			// security review). The span is fenced with one more backtick
+			// than the names longest run, so every name stays inside one
+			// code span (issue #35); the merge info itself keeps the real
+			// name. A backslash escape does not work inside a code span.
+			fmt.Fprintf(&b, "- %s\n", codeSpan(f))
 		}
 		b.WriteString("\nResolve every conflict in place: keep the intended code and delete every conflict marker line " +
 			"(the lines starting with `<<<<<<<`, `=======` and `>>>>>>>`). The publish step refuses to push anything " +
@@ -1724,4 +1770,29 @@ func noMergeBriefSection(path string) (string, error) {
 		"Do not merge the base branch and do not copy its changes by hand: publish refuses a patch that replays " +
 		"base-branch changes it cannot verify as a merge. Work on the branch as it is, make only this task's changes, " +
 		"and say in your result that the pull request still needs to catch up with its base branch.\n", nil
+}
+
+// codeSpan renders s as one CommonMark inline code span. The delimiter run
+// is one backtick longer than the longest backtick run inside s, so a name
+// holding backticks (a conflicted path from the merge info, which is
+// untrusted) cannot close the span early, and the span is padded with a
+// space when s starts or ends with a backtick, as CommonMark requires
+// (issue #35). A name without backticks renders as the plain `s` span.
+func codeSpan(s string) string {
+	longest, run := 0, 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '`' {
+			run++
+			if run > longest {
+				longest = run
+			}
+		} else {
+			run = 0
+		}
+	}
+	delim := strings.Repeat("`", longest+1)
+	if strings.HasPrefix(s, "`") || strings.HasSuffix(s, "`") {
+		return delim + " " + s + " " + delim
+	}
+	return delim + s + delim
 }

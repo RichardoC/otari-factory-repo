@@ -34,6 +34,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -1815,11 +1816,18 @@ func (v *vfs) Access(name string, flags sqlite3vfs.AccessFlag) (bool, error) {
 	return true, nil
 }
 
-// FullPathname implements sqlite3vfs.VFS: it returns name unchanged, as
-// file names are already cluster-wide (the TODO of fulfilling
-// canonicalisation properly stands).
+// FullPathname implements sqlite3vfs.VFS. Although file names are already
+// cluster-wide — there is no on-disk hierarchy to resolve them against —
+// SQLite reaches xFullPathname on every open and hands through whatever
+// spelling the caller used, so an uncleaned name (./app.db, dir/../app.db)
+// would otherwise reach the VFS verbatim and map to a different ConfigMap
+// set than the cleaned spelling, splitting one database in two on the
+// cluster. The rule implemented here: clean the name and normalise
+// separators, while absolute names pass through unchanged (SQLite appends
+// -journal itself after canonicalisation, so cleaning the base name
+// suffices).
 func (v *vfs) FullPathname(name string) string {
-	return name
+	return filepath.ToSlash(filepath.Clean(name))
 }
 
 // CheckReservedLock implements sqlite3vfs.File — with a DELIBERATELY

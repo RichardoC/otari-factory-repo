@@ -3757,3 +3757,31 @@ func TestNewVFSNonPositiveLockLeaseKeepsDefault(t *testing.T) {
 		})
 	}
 }
+
+func TestFullPathname(t *testing.T) {
+	v, _ := newTestVFS(t)
+
+	// Different spellings of the same relative name must canonicalise to
+	// one name, so one database cannot split into two ConfigMap sets
+	// depending on how it was opened. Absolute names pass through
+	// unchanged.
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "dot slash", in: "./app.db", want: "app.db"},
+		{name: "dotdot traversal", in: "dir/../app.db", want: "app.db"},
+		{name: "already clean", in: "app.db", want: "app.db"},
+		{name: "absolute", in: "/data/app.db", want: "/data/app.db"},
+		{name: "absolute clean", in: "/data/sub/../app.db", want: "/data/app.db"},
+		{name: "trailing slash removed", in: "app.db/", want: "app.db"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := v.FullPathname(tc.in); got != tc.want {
+				t.Errorf("FullPathname(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}

@@ -3364,6 +3364,23 @@ func Decide(name string, ev event, labelName string, lookupPR, lookupIssue func(
 			return Decision{Run: true, Reason: "plan dispatch", Mode: "plan",
 				Base: ev.Repository.DefaultBranch, Lane: lane}, nil
 		}
+		// A dispatch naming more than one target — issue, pr and review
+		// together — would silently run only the first: the pr path is
+		// consulted before the review and issue paths, so issue=5 pr=7
+		// runs PR 7 under a run name the queue parses as issue 5, holding
+		// issue 5's areas while PR 7 is never marked in flight (issue
+		// #41). Refuse it the way the plan branch above refuses a plan
+		// mixed with a target: skip, and name the extra input.
+		var targets []string
+		for _, name := range []string{"issue", "pr", "review"} {
+			if ev.Inputs[name] != "" {
+				targets = append(targets, name)
+			}
+		}
+		if len(targets) > 1 {
+			return skip(fmt.Sprintf("a dispatch takes only one of issue, pr and review; it names %s",
+				strings.Join(targets, ", "))), nil
+		}
 		if n, ok := dispatchIssue(ev.Inputs["pr"]); ok {
 			pr, err := lookupPR(n)
 			if err != nil {

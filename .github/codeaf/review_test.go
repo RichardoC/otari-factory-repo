@@ -2677,15 +2677,19 @@ func TestDecideDispatchReview(t *testing.T) {
 		}
 	})
 
-	t.Run("the pr input still wins over the review input", func(t *testing.T) {
-		lookupPR := func(int) (item, error) { return openPR, nil }
+	// Issue #41: a dispatch naming both pr and review is refused instead
+	// of silently running the pr path — the run name would be built with a
+	// different precedence than the mode, so the queue would hold the
+	// wrong number in flight.
+	t.Run("a dispatch naming both pr and review is refused", func(t *testing.T) {
+		lookupPR := func(int) (item, error) { t.Fatal("unexpected PR lookup"); return item{}, nil }
 		ev := event{Inputs: map[string]string{"pr": "7", "review": "7"}}
 		got, err := Decide("workflow_dispatch", ev, "codeaf", lookupPR, func(int) (item, error) { return item{}, nil })
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !got.Run || got.Mode != "pr" || got.Reason != "workflow dispatch" {
-			t.Fatalf("Decide = %+v, want the continuation path", got)
+		if got.Run || got.Reason != "a dispatch takes only one of issue, pr and review; it names pr, review" {
+			t.Fatalf("Decide = %+v, want a skip naming both inputs", got)
 		}
 	})
 }

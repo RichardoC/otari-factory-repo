@@ -4628,3 +4628,83 @@ func TestProxyUndecodable200IsRecorded(t *testing.T) {
 		t.Errorf("metered row %q counts status calls with the 502 lines filtered out, so the count assertion above proves nothing", filtered)
 	}
 }
+
+// TestDecideTargetDispatch covers the gate's refusal of a workflow_dispatch
+// naming more than one target (issue #41): a dispatch carrying more than one
+// of the issue, pr and review inputs would silently run only the first — the
+// pr path is consulted before the review and issue paths — while the run name
+// is built with a different precedence, so the queue would parse the title as
+// another number and hold the wrong areas in flight. A mixed dispatch is
+// skipped with a reason naming the extra input, the way the plan branch
+// refuses a plan mixed with a target; every single-target dispatch still
+// runs.
+func TestDecideTargetDispatch(t *testing.T) {
+	t.Setenv("GITHUB_REPOSITORY", "RichardoC/factory-repo")
+	t.Setenv("GITHUB_RUN_ID", "42")
+	labelled := []label{{Name: "codeaf"}}
+	openIssue := item{Number: 5, State: "open", Labels: labelled}
+	mkPR := func(number int) item {
+		pr := item{Number: number, State: "open", Labels: labelled}
+		pr.Head.Ref = "codeaf/issue-5"
+		pr.Head.Repo = &struct {
+			FullName string `json:"full_name"`
+		}{FullName: "RichardoC/factory-repo"}
+		pr.Base.Ref = "main"
+		return pr
+	}
+	decide := func(inputs map[string]string) Decision {
+		calledPR, calledIssue := false, false
+		lookupPR := func(int) (item, error) { calledPR = true; return mkPR(7), nil }
+		lookupIssue := func(int) (item, error) { calledIssue = true; return openIssue, nil }
+		ev := event{Inputs: inputs}
+		ev.Repository.DefaultBranch = "main"
+		got, err := Decide("workflow_dispatch", ev, "codeaf", lookupPR, lookupIssue)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !got.Run && (calledPR || calledIssue) {
+			t.Fatalf("a skipped dispatch must not look its target up (pr=%t issue=%t)", calledPR, calledIssue)
+		}
+		return got
+	}
+	for _, c := range []struct {
+		name  string
+		set   []string
+		extra string
+	}{
+		{"issue and pr", []string{"issue", "pr"}, "pr"},
+		{"pr and review", []string{"pr", "review"}, "review"},
+		{"review and issue", []string{"review", "issue"}, "issue"},
+	} {
+		t.Run("dispatch with "+c.name+" is refused", func(t *testing.T) {
+			inputs := map[string]string{}
+			for _, name := range c.set {
+				inputs[name] = "7"
+			}
+			got := decide(inputs)
+			if got.Run {
+				t.Fatalf("Decide = %+v; want a skip", got)
+			}
+			for _, name := range c.set {
+				if !strings.Contains(got.Reason, name) {
+					t.Fatalf("reason %q must name the extra input %q", got.Reason, c.extra)
+				}
+			}
+		})
+	}
+	for _, c := range []struct {
+		input, mode string
+		number      int
+	}{
+		{"issue", "issue", 5},
+		{"pr", "pr", 7},
+		{"review", "review", 7},
+	} {
+		t.Run("dispatch with only "+c.input+" still runs", func(t *testing.T) {
+			got := decide(map[string]string{c.input: "7"})
+			if !got.Run || got.Mode != c.mode || got.Number != c.number {
+				t.Fatalf("Decide = %+v; want a %s run on %d", got, c.mode, c.number)
+			}
+		})
+	}
+}
